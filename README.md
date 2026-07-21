@@ -35,14 +35,15 @@ uv-strerror
 ## Dependencies
 
 This is the I/O module extracted from Igropyr; it is **not standalone**.
-It imports two small sibling libraries from Igropyr:
+It imports two small sibling libraries:
 
-- `(igropyr platform)` — supported-host detection and shared-library
-  loading (the `libuv` / `libc` candidate lists per OS, struct-offset
-  constants).
-- `(igropyr util)` — a handful of dependency-free string helpers.
+- [`(igropyr platform)`][platform] — supported-host detection and
+  shared-library loading (the `libuv` / `libc` candidate lists per OS,
+  struct-offset constants).
+- [`(igropyr util)`][util] — a handful of dependency-free string
+  helpers (a dependency of `platform`).
 
-Both live in the [Igropyr][igropyr] source tree. To use `(igropyr
+Both also live in the [Igropyr][igropyr] source tree. To use `(igropyr
 libuv)`, put `libuv.sc` alongside `platform.sc` and `util.sc` in an
 `igropyr/` directory on your library path, and have **libuv** installed
 on the host (Homebrew `libuv` on macOS, the `libuv` package on
@@ -60,3 +61,5 @@ MIT. See [LICENSE](LICENSE).
 [chez]: https://www.scheme.com
 [libuv]: https://libuv.org
 [igropyr]: https://github.com/guenchi/Igropyr
+[platform]: https://github.com/guenchi/igropyr-platform
+[util]: https://github.com/guenchi/igropyr-util

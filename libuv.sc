@@ -11,14 +11,15 @@
 ;;; frame and corrupt the process.
 
 (library (igropyr libuv)
-  (export uv-init! uv-poll! now-ms uv-set-deliver!
+  (export uv-init! uv-poll! now-ms now-ns uv-set-deliver! uv-owner-died!
           tcp-listen! tcp-stop-listen! tcp-connect! dns-resolve!
-          file-read-async!
-          file-stream-open! file-stream-read! file-stream-close!
+          file-read-async! file-realpath
+          file-stream-open! file-stream-open-under!
+          file-stream-read! file-stream-close!
           file-stream-own! file-stream-raw! file-stream-chunk-ptr
           tcp-read-start! tcp-write! tcp-writev! tcp-write-foreign!
           tcp-close!
-          conn? conn-handle conn-owner conn-set-owner!
+          conn? conn-handle conn-owner conn-set-owner! conn-peer-ip
           conn-state conn-count uv-strerror)
   (import (chezscheme) (igropyr platform))
 
@@ -65,6 +66,9 @@
   (define uv-fs-read  (foreign-procedure "uv_fs_read" (void* void* int void* unsigned-int long void*) int))
   (define uv-fs-close (foreign-procedure "uv_fs_close" (void* void* int void*) int))
   (define uv-fs-fstat (foreign-procedure "uv_fs_fstat" (void* void* int void*) int))
+  (define uv-fs-realpath
+    (foreign-procedure "uv_fs_realpath" (void* void* string void*) int))
+  (define uv-fs-get-ptr (foreign-procedure "uv_fs_get_ptr" (void*) void*))
   (define uv-fs-get-result (foreign-procedure "uv_fs_get_result" (void*) ssize_t))
   (define uv-fs-get-statbuf (foreign-procedure "uv_fs_get_statbuf" (void*) void*))
   (define uv-fs-req-cleanup (foreign-procedure "uv_fs_req_cleanup" (void*) void))
@@ -85,11 +89,27 @@
   (define memcpy-from-c  (foreign-procedure "memcpy" (u8* void* size_t) void*))
   (define memcpy-to-c    (foreign-procedure "memcpy" (void* u8* size_t) void*))
   (define memcpy-cc      (foreign-procedure "memcpy" (void* void* size_t) void*))
+  (define c-open          (foreign-procedure "open" (string int int) int))
+  (define c-openat        (foreign-procedure "openat" (int string int int) int))
+  (define c-close         (foreign-procedure "close" (int) int))
 
   (define UV-CONNECT 2)
   (define UV-GETADDRINFO 8)
   (define UV-FS 6)
   (define O-RDONLY 0)
+  ;; open(2) flags differ across the supported Unix families. Static-file
+  ;; confinement uses openat one component at a time with O_NOFOLLOW, so
+  ;; no pathname component can be swapped to a symlink between validation
+  ;; and the actual open.
+  (define O-DIRECTORY
+    (case platform-os ((linux) #o200000) ((macos) #x100000)
+                      ((freebsd) #x20000) (else 0)))
+  (define O-NOFOLLOW
+    (case platform-os ((linux) #o400000) ((macos freebsd) #x100)
+                      (else 0)))
+  (define O-CLOEXEC
+    (case platform-os ((linux) #o2000000) ((macos) #x1000000)
+                      ((freebsd) #x100000) (else 0)))
   (define UV-EINVAL -22)
   (define S-IFMT #o170000)
   (define S-IFREG #o100000)
@@ -107,6 +127,11 @@
   ;; generic-arithmetic div on this hot path (called per receive
   ;; timeout and per event-loop pass).
   (define (now-ms) (fxdiv (uv-hrtime) 1000000))
+
+  ;; Monotonic nanoseconds (same clock as now-ms, undivided) -- for timing
+  ;; sub-millisecond spans where now-ms rounds to 0. A raw value is a fixnum
+  ;; (see now-ms), so a difference of two is exact and allocation-free.
+  (define (now-ns) (uv-hrtime))
 
   (define (check who r)
     (if (< r 0)
@@ -141,6 +166,48 @@
   (define deliver (lambda (owner msg) (void)))
   (define (uv-set-deliver! proc) (set! deliver proc))
 
+  ;; Reclaim what a dead owner can no longer close itself. A killed
+  ;; process does not run its dynamic-wind winders (see actor.sc @kill),
+  ;; so a handler killed mid-download would otherwise leak its open fd,
+  ;; its 256 KiB foreign chunk buffer and the uv_fs_t for the life of
+  ;; the VM -- fs-table roots them, so the GC cannot help. The actor
+  ;; layer calls this from its process-teardown path.
+  (define (uv-owner-died! owner)
+    (with-interrupts-disabled
+      ;; Close established sockets. conn-table is the GC root for both the
+      ;; Scheme record and libuv handle, so leaving one here leaks an fd for
+      ;; the lifetime of the VM.
+      (vector-for-each
+        (lambda (handle)
+          (let ((c (hashtable-ref conn-table handle #f)))
+            (when (and c (eq? (conn-owner c) owner)) (tcp-close! c))))
+        (hashtable-keys conn-table))
+      ;; A connect request cannot be synchronously cancelled on every
+      ;; supported libuv. Clear its owner instead; on-connect then closes a
+      ;; late successful handle rather than registering it for a dead pid.
+      (vector-for-each
+        (lambda (req)
+          (let ((entry (hashtable-ref connect-table req #f)))
+            (when (and entry (eq? (cdr entry) owner)) (set-cdr! entry #f))))
+        (hashtable-keys connect-table))
+      ;; DNS has no handle to close. Suppress its eventual delivery while
+      ;; retaining the request entry so the callback still frees it. Do NOT
+      ;; "simplify" this into a hashtable-delete!: on-getaddrinfo runs either
+      ;; way and does the foreign-free, so dropping the key here only loses
+      ;; the record that this request is still outstanding. Setting #f is
+      ;; safe because both delivery sites are guarded by (when owner ...).
+      (vector-for-each
+        (lambda (req)
+          (when (eq? (hashtable-ref getaddrinfo-table req #f) owner)
+            (hashtable-set! getaddrinfo-table req #f)))
+        (hashtable-keys getaddrinfo-table))
+      (vector-for-each
+        (lambda (req)
+          (let ((op (hashtable-ref fs-table req #f)))
+            (when (and op (eq? (fs-op-owner op) owner))
+              (file-stream-close! op))))
+        (hashtable-keys fs-table))))
+
   ;; live listeners: handle address -> accept hook, one entry per
   ;; tcp-listen!. Keyed dispatch (not a single global) so several
   ;; servers can listen on different ports in one process; the table
@@ -151,6 +218,8 @@
   (define uv-loop 0)
   (define wakeup-timer 0)
   (define sockaddr-buf 0)
+  (define peername-buf 0)            ; conn-peer-ip scratch (own buffer:
+  (define peername-len 0)            ; sockaddr-buf holds connect state)
   (define read-buf 0)
   (define read-buf-size 65536)
   ;; reusable scratch for the uv_try_write fast path (single OS thread,
@@ -504,14 +573,18 @@
           (foreign-free req)
           (when entry
             (let ((handle (car entry)) (owner (cdr entry)))
-              (if (< status 0)
-                  (begin
-                    (uv-close handle on-close-entry)
-                    (deliver owner (vector 'tcp-connect-failed status)))
-                  (let ((c (make-conn handle owner 'open)))
-                    (uv-tcp-nodelay handle 1)
-                    (hashtable-set! conn-table handle c)
-                    (deliver owner (vector 'tcp-connected c))))))))
+              (cond
+                ((< status 0)
+                 (uv-close handle on-close-entry)
+                 (when owner (deliver owner (vector 'tcp-connect-failed status))))
+                ((not owner)
+                 ;; The owner died while connect was in flight.
+                 (uv-close handle on-close-entry))
+                (else
+                 (let ((c (make-conn handle owner 'open)))
+                   (uv-tcp-nodelay handle 1)
+                   (hashtable-set! conn-table handle c)
+                   (deliver owner (vector 'tcp-connected c)))))))))
       (void* int)
       void))
 
@@ -558,6 +631,8 @@
     (set! wakeup-timer (foreign-alloc timer-handle-size))
     (check 'uv-timer-init (uv-timer-init uv-loop wakeup-timer))
     (set! sockaddr-buf (foreign-alloc 128))
+    (set! peername-buf (foreign-alloc 128))
+    (set! peername-len (foreign-alloc 8))
     (set! read-buf (foreign-alloc read-buf-size))
     (set! write-scratch (foreign-alloc write-scratch-size))
     (set! scratch-buf (foreign-alloc buf-t-size)))
@@ -576,6 +651,7 @@
   ;; optional trailing arg: uv_tcp_bind flags (UV_TCP_REUSEPORT = 2,
   ;; kernel-balanced multi-process listening; Linux/FreeBSD only)
   (define (tcp-listen! host port backlog on-accept . opts)
+    (with-interrupts-disabled          ; shared sockaddr-buf: see tcp-connect!
     (let ((flags (if (pair? opts) (car opts) 0))
           (l (foreign-alloc tcp-handle-size)))
       (check 'uv-tcp-init (uv-tcp-init uv-loop l))
@@ -583,7 +659,7 @@
       (check 'uv-tcp-bind (uv-tcp-bind l sockaddr-buf flags))
       (check 'uv-listen (uv-listen l backlog on-connection-entry))
       (hashtable-set! listener-table l on-accept)
-      l))
+      l)))
 
   ;; Stop accepting new connections (graceful shutdown step 1);
   ;; established connections are unaffected. With a listener handle
@@ -608,6 +684,98 @@
           (fs-fail! op req r)))
       op))
 
+ ;; Start the ordinary asynchronous fstat/read pipeline from an fd that
+  ;; has already been opened securely with openat.
+  (define (fs-start-fd! fd path owner mode)
+    (let* ((req (foreign-alloc fs-req-size))
+           (op (make-fs-op owner path mode req 'fstat #f #f fd 0 0 '() 0 0)))
+      (hashtable-set! fs-table req op)
+      (start-fs-fstat! op req)
+      op))
+
+  (define (relative-parts rel)
+    (let ((n (string-length rel)))
+      (let loop ((i 0) (start 0) (acc '()))
+        (cond
+          ((= i n)
+           (let ((part (substring rel start i)))
+             (reverse (if (or (string=? part "") (string=? part "."))
+                          acc (cons part acc)))))
+          ((char=? (string-ref rel i) #\/)
+           (let ((part (substring rel start i)))
+             (loop (+ i 1) (+ i 1)
+                   (if (or (string=? part "") (string=? part "."))
+                       acc (cons part acc)))))
+          (else (loop (+ i 1) start acc))))))
+
+  ;; Open rel beneath root without following any untrusted path component.
+  ;; The trusted root is opened once per call; every child is then resolved
+  ;; relative to that stable directory fd. Returns an fd or -1.
+  ;;
+  ;; Do NOT hoist the root open into a cached fd. A directory fd names an
+  ;; inode, not a path -- which is exactly why the walk below cannot be
+  ;; raced, and exactly why keeping one across requests would pin the
+  ;; directory that was there when it was opened. A deployment that swaps
+  ;; its root atomically (ln -sfn releases/v2 current) would go on serving
+  ;; the previous release until the process restarted, with nothing to
+  ;; indicate it. The saving would be one syscall out of the 1 + 2N this
+  ;; makes, on the cache-miss path only.
+  (define (open-under root rel)
+    (let ((parts (relative-parts rel)))
+      (if (or (null? parts)
+              (exists (lambda (p)
+                        (or (string=? p "..")
+                            (let loop ((i 0))
+                              (and (< i (string-length p))
+                                   (or (char=? (string-ref p i) #\nul)
+                                       (loop (+ i 1)))))))
+                      parts))
+          -1
+          (let ((root-fd
+                  (c-open root
+                    (bitwise-ior O-RDONLY O-DIRECTORY O-CLOEXEC) 0)))
+            (if (< root-fd 0)
+                -1
+                (let loop ((dir root-fd) (xs parts))
+                  (let* ((last? (null? (cdr xs)))
+                         (flags (bitwise-ior O-RDONLY O-CLOEXEC O-NOFOLLOW
+                                  (if last? 0 O-DIRECTORY)))
+                         (next (c-openat dir (car xs) flags 0)))
+                    (c-close dir)
+                    (cond ((< next 0) -1)
+                          (last? next)
+                          (else (loop next (cdr xs)))))))))))
+
+  ;; The path the OS itself would call this file: symlinks and . / ..
+  ;; resolved, and on a case-insensitive filesystem the spelling corrected
+  ;; to the one on disk, so every way of naming one file gives one answer.
+  ;; #f if it does not resolve.
+  ;;
+  ;; SYNCHRONOUS -- a passed callback of 0 makes uv_fs_* block -- so this
+  ;; stalls the scheduler for one path lookup. That is the same cost the
+  ;; surrounding code already pays for file-exists?; do not put it on a
+  ;; path that runs per request when the answer can be cached.
+  (define (file-realpath path)
+    (let ((req (foreign-alloc fs-req-size)))
+      (dynamic-wind
+        (lambda () (void))
+        (lambda ()
+          (let ((r (uv-fs-realpath uv-loop req path 0)))
+            (and (>= r 0)
+                 (let ((p (uv-fs-get-ptr req)))
+                   (and (not (eqv? p 0))
+                        ;; the string is owned by the request; copy before
+                        ;; the cleanup below frees it
+                        (let loop ((i 0) (acc '()))
+                          (let ((b (foreign-ref 'unsigned-8 p i)))
+                            (if (fx= b 0)
+                                (utf8->string
+                                  (u8-list->bytevector (reverse acc)))
+                                (loop (fx+ i 1) (cons b acc))))))))))
+        (lambda ()
+          (uv-fs-req-cleanup req)
+          (foreign-free req)))))
+
   ;; Read a whole file on libuv's thread pool. The owner process later
   ;; receives #(file-read ,bytevector) or #(file-error ,errno). Never
   ;; blocks the scheduler, even for large files or slow filesystems.
@@ -627,6 +795,15 @@
   ;; holds one chunk of memory, not the file.
   (define (file-stream-open! path owner)
     (fs-start! path owner 'stream))
+
+  ;; Confined counterpart used by app-static and rooted send-file!. #f is
+  ;; an immediate refusal (missing path, symlink, or invalid component).
+  (define (file-stream-open-under! root rel owner)
+    ;; Keep the raw fd continuously protected: before fs-start-fd! installs
+    ;; it in fs-table, actor teardown has no way to discover and close it.
+    (with-interrupts-disabled
+      (let ((fd (open-under root rel)))
+        (and (>= fd 0) (fs-start-fd! fd rel owner 'stream)))))
 
   ;; Switch chunk delivery to lengths: the bytes stay in the stream's C
   ;; buffer (file-stream-chunk-ptr) until the next pull, so a consumer
@@ -673,6 +850,12 @@
   ;; #(tcp-connected ,conn) or #(tcp-connect-failed ,errno). Call
   ;; tcp-read-start! on the conn after the connected message arrives.
   (define (tcp-connect! host port owner)
+    ;; sockaddr-buf is a process-wide singleton and the allocations
+    ;; below are preemption points: another green process starting its
+    ;; own connect (or a listener binding) would overwrite the address
+    ;; we just resolved, and we would connect to ITS host. Also covers
+    ;; the connect-table mutation. Nothing here yields.
+    (with-interrupts-disabled
     (check 'uv-ip4-addr (uv-ip4-addr host port sockaddr-buf))
     (let ((h (foreign-alloc tcp-handle-size))
           (req (foreign-alloc connect-req-size)))
@@ -684,7 +867,31 @@
           (foreign-free req)
           (uv-close h on-close-entry)
           (error 'tcp-connect! (uv-strerror r)))
-        #t)))
+        #t))))
+
+  (define uv-tcp-getpeername
+    (foreign-procedure "uv_tcp_getpeername" (void* void* void*) int))
+
+  ;; The peer's IPv4 address as "a.b.c.d", or #f (not open, IPv6, or the
+  ;; socket is gone). This is the ONLY caller-visible identity a remote
+  ;; client cannot forge -- unlike any header it sends -- so it is what
+  ;; per-client policy (rate limiting, banning) must key on.
+  (define (conn-peer-ip c)
+    (and (eq? (conn-state c) 'open)
+         (with-interrupts-disabled          ; shared peername buffers
+           (foreign-set! 'int peername-len 0 128)
+           (and (>= (uv-tcp-getpeername (conn-handle c) peername-buf peername-len) 0)
+                ;; sockaddr_in: sin_family differs in layout across
+                ;; platforms, but sin_addr is always at offset 4
+                (let ((fam (case platform-os
+                             ((macos freebsd) (foreign-ref 'unsigned-8 peername-buf 1))
+                             (else (foreign-ref 'unsigned-16 peername-buf 0)))))
+                  (and (= fam AF-INET)
+                       (string-append
+                         (number->string (foreign-ref 'unsigned-8 peername-buf 4)) "."
+                         (number->string (foreign-ref 'unsigned-8 peername-buf 5)) "."
+                         (number->string (foreign-ref 'unsigned-8 peername-buf 6)) "."
+                         (number->string (foreign-ref 'unsigned-8 peername-buf 7)))))))))
 
   ;; Start delivering #(tcp-data ...) messages to the conn's owner.
   ;; Call after conn-set-owner!.
@@ -727,6 +934,16 @@
         (let ((total (fold-left (lambda (a b) (+ a (bytevector-length b))) 0 segs)))
           (cond
             ((<= total write-scratch-size)
+             ;; write-scratch and scratch-buf are process-wide singletons,
+             ;; and this runs in ordinary green processes (an HTTP worker
+             ;; writing a response, a db client sending a query) with the
+             ;; preemption timer live. The packing loop and its foreign
+             ;; calls are safe points, so without this guard a second
+             ;; writer could overwrite the scratch between our pack and
+             ;; our uv_try_write -- and we would send ITS bytes on OUR
+             ;; socket. with-interrupts-disabled is exit-safe; nothing in
+             ;; here yields.
+             (with-interrupts-disabled
              ;; pack segments into scratch, then try to write in one shot
              (let loop ((ss segs) (off 0))
                (unless (null? ss)
@@ -746,7 +963,7 @@
                  (else                              ; EAGAIN/0: queue all
                   (enqueue-write! c total
                     (lambda (dest) (memcpy-cc dest write-scratch total))
-                    on-done)))))
+                    on-done))))))
             (else                                    ; too big for scratch
              (enqueue-write! c total
                (lambda (dest)
@@ -769,7 +986,7 @@
   (define (tcp-write-foreign! c ptr len on-done)
     (if (not (eq? (conn-state c) 'open))
         (begin (when on-done (on-done -1)) #f)
-        (begin
+        (with-interrupts-disabled          ; shared scratch-buf: see tcp-writev!
           (foreign-set! 'void* scratch-buf 0 ptr)
           (foreign-set! 'unsigned-64 scratch-buf 8 len)
           (let ((n (uv-try-write (conn-handle c) scratch-buf 1)))

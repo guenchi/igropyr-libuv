@@ -17,6 +17,7 @@
           file-stream-open! file-stream-open-under!
           file-stream-read! file-stream-close!
           file-stream-own! file-stream-raw! file-stream-chunk-ptr
+          fs-count
           tcp-read-start! tcp-read-stop! tcp-write! tcp-writev! tcp-write-foreign!
           tcp-close!
           conn? conn-handle conn-owner conn-set-owner! conn-peer-ip
@@ -190,15 +191,45 @@
       (hashtable-set! owner-index owner
         (cons (cons kind key) (hashtable-ref owner-index owner '())))))
 
+  ;; Drop an entry when the resource is finished with.
+  ;;
+  ;; Leaving them was defensible while a stale entry only cost a failed
+  ;; re-check -- but the list is per OWNER, and an owner can be long-lived.
+  ;; A process that reconnects, resolves and reads files for days
+  ;; accumulated one entry per operation it ever performed, held for the
+  ;; life of that process, and then walked every one of them inside a
+  ;; no-interrupts region when it finally died. Removal keeps the cost
+  ;; proportional to what is OPEN rather than to what has ever happened.
+  ;;
+  ;; Still a superset, not the truth: a resource handed on to another owner
+  ;; leaves its entry behind under the old one, and uv-owner-died! re-checks
+  ;; every candidate against the real owner before touching it.
+  (define (unindex-owner! owner kind key)
+    (when owner
+      (let ((xs (hashtable-ref owner-index owner '())))
+        (unless (null? xs)
+          (let ((rest (remp (lambda (e)
+                              (and (eq? (car e) kind) (equal? (cdr e) key)))
+                            xs)))
+            (if (null? rest)
+                (hashtable-delete! owner-index owner)
+                (hashtable-set! owner-index owner rest)))))))
+
   ;; Ownership is public and mutable -- an application hands a conn to the
   ;; process that will read it, and may hand it on again. The index has to
   ;; learn about every such move, so the setter is the hook rather than the
   ;; raw record field. The old owner's entry is left behind on purpose: it
   ;; becomes a stale candidate, which costs one failed re-check, whereas
   ;; forgetting to add the new one would skip a live resource at teardown.
+  ;; The field and the index entry are ONE step. A safe point between them
+  ;; is a window in which the new owner can die: uv-owner-died! for that pid
+  ;; then finds no entry and skips the resource, and the entry that arrives
+  ;; afterwards names a process already gone -- nothing will ever reclaim
+  ;; it. Same family as the enqueue-write! and conn-on-close! windows.
   (define (conn-set-owner! c owner)
-    (conn-set-owner-field! c owner)
-    (index-owner! owner 'conn (conn-handle c)))
+    (with-interrupts-disabled
+      (conn-set-owner-field! c owner)
+      (index-owner! owner 'conn (conn-handle c))))
 
   ;; Reclaim what a dead owner can no longer close itself. A killed
   ;; process does not run its dynamic-wind winders (see actor.sc @kill),
@@ -308,6 +339,7 @@
         (let ((c (hashtable-ref conn-table handle #f)))
           (hashtable-delete! conn-table handle)
           (when c
+            (unindex-owner! (conn-owner c) 'conn handle)
             (conn-set-state! c 'closed)
             (let ((clean (conn-cleanup c)))
               (when clean
@@ -416,6 +448,7 @@
   (define (fs-cleanup! op req)
     (when (> (fs-op-data op) 0) (foreign-free (fs-op-data op)))
     (when (> (fs-op-buf op) 0) (foreign-free (fs-op-buf op)))
+    (unindex-owner! (fs-op-owner op) 'fs req)
     (hashtable-delete! fs-table req)
     (foreign-free req))
 
@@ -627,9 +660,12 @@
                  (uv-close handle on-close-entry))
                 (else
                  (let ((c (make-conn handle owner 'open #f)))
-                   (index-owner! owner 'conn handle)
-                   (uv-tcp-nodelay handle 1)
-                   (hashtable-set! conn-table handle c)
+                   ;; index and table together: an owner dying between them
+                   ;; is told about a conn that teardown cannot find
+                   (with-interrupts-disabled
+                     (index-owner! owner 'conn handle)
+                     (uv-tcp-nodelay handle 1)
+                     (hashtable-set! conn-table handle c))
                    (deliver owner (vector 'tcp-connected c)))))))))
       (void* int)
       void))
@@ -723,8 +759,9 @@
   (define (fs-start! path owner mode)
     (let* ((req (foreign-alloc fs-req-size))
            (op (make-fs-op owner path mode req 'open #f #f -1 0 0 '() 0 0)))
-      (hashtable-set! fs-table req op)
-      (index-owner! owner 'fs req)
+      (with-interrupts-disabled
+        (hashtable-set! fs-table req op)
+        (index-owner! owner 'fs req))
       (let ((r (uv-fs-open uv-loop req path O-RDONLY 0 on-fs-entry)))
         (when (< r 0)
           (uv-fs-req-cleanup req)
@@ -736,8 +773,9 @@
   (define (fs-start-fd! fd path owner mode)
     (let* ((req (foreign-alloc fs-req-size))
            (op (make-fs-op owner path mode req 'fstat #f #f fd 0 0 '() 0 0)))
-      (hashtable-set! fs-table req op)
-      (index-owner! owner 'fs req)
+      (with-interrupts-disabled
+        (hashtable-set! fs-table req op)
+        (index-owner! owner 'fs req))
       (start-fs-fstat! op req)
       op))
 
@@ -866,8 +904,23 @@
   ;; Transfer delivery of subsequent messages to another process (e.g.
   ;; a pump spawned after the stream was opened). Call it before the
   ;; new owner's first pull, with no pull in flight.
+  ;; How many file streams are open. Same purpose as conn-count: an fd,
+  ;; a uv_fs_t and a 256 KiB foreign buffer that outlive their owner are
+  ;; invisible from Scheme -- fs-table roots them, so the GC will not
+  ;; report them either -- and a leak that nothing can count is a leak
+  ;; nothing can assert about.
+  (define (fs-count) (hashtable-size fs-table))
+
   (define (file-stream-own! op pid)
-    (fs-op-owner-set! op pid))
+    (with-interrupts-disabled
+      (fs-op-owner-set! op pid)
+    ;; The INDEX has to learn about the move too, exactly as conn-set-owner!
+    ;; does for connections. Setting only the field meant uv-owner-died! for
+    ;; the new owner found nothing to reclaim: a pump killed mid-download
+    ;; left its fd, its uv_fs_t and its 256 KiB foreign buffer rooted by
+    ;; fs-table for the life of the VM, which is the leak the index exists
+    ;; to prevent.
+      (index-owner! pid 'fs (fs-op-req op))))
 
   (define (file-stream-read! op)
     (when (and (not (fs-op-aborted? op)) (eq? (fs-op-phase op) 'idle))

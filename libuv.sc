@@ -1,34 +1,57 @@
-;;; (igropyr libuv) -- minimal libuv FFI layer for Igropyr.
+#!chezscheme
+;;; (igropyr libuv) -- the raw libuv binding layer.
 ;;;
-;;; This library talks to libuv directly through Chez's FFI: no C shim.
-;;; It knows nothing about green processes; message delivery to the
-;;; upper layer goes through a hook installed with uv-set-deliver!.
+;;; THE CUT IS BY OWNERSHIP, NOT BY SUBJECT. What lives here is what belongs
+;;; to the LOOP: the FFI bindings and their constants, the loop handle and the
+;;; process-wide buffers allocated with it, and the two callbacks the loop
+;;; itself drives (its wakeup timer and uv_walk). Everything owned by a
+;;; connection or by an owning process -- conns, listeners, DNS, files, the
+;;; TLS codec -- is (igropyr tcp), one layer up.
 ;;;
-;;; INVARIANT: code running inside a libuv callback (anything reached
-;;; from uv-poll!) must never yield, never block in receive, and never
-;;; raise. Callbacks only copy data, mutate registries, and deliver
-;;; messages. Yielding would unwind a continuation through a C stack
-;;; frame and corrupt the process.
+;;; NEVER IMPORT (igropyr tcp) OR (igropyr tls-core) HERE. This library is
+;;; below both; (igropyr libuv) is a façade above them that re-exports the
+;;; public API name for name, so existing consumers see no change at all.
+;;;
+;;; THE SHARED BUFFERS ARE HANDED OUT AS LEASES, NOT AS POINTERS. Their
+;;; whole safety argument is "packed and used inside one interrupt-disabled
+;;; region, with no yield between the pack and the syscall" -- and that
+;;; argument lives HERE, next to the buffer. Exporting the raw address would
+;;; move the argument out of sight of every caller that depends on it, so a
+;;; caller instead passes a thunk that runs inside the region.
 
 (library (igropyr libuv)
-  (export uv-init! uv-poll! now-ms now-ns uv-set-deliver! uv-owner-died!
-          tcp-listen! tcp-stop-listen! tcp-connect! dns-resolve!
-          file-read-async! file-realpath
-          file-stream-open! file-stream-open-under!
-          file-stream-read! file-stream-close!
-          file-stream-own! file-stream-raw! file-stream-chunk-ptr
-          fs-open-async! fs-write-async! fs-fsync-async!
-          fs-rename-async! fs-close-async! fs-mkdir-async!
-          fs-job-count fs-fd-count
-          fs-o-rdonly fs-o-wronly fs-o-creat fs-o-trunc fs-o-excl
-          fs-o-directory fs-o-cloexec
-          fs-count
-          tcp-read-start! tcp-read-stop! tcp-write! tcp-writev! tcp-write-foreign!
-          tcp-close!
-          conn? conn-handle conn-owner conn-set-owner! conn-peer-ip
-          conn-on-close!
-          conn-state conn-count uv-strerror)
+  (export
+    ;; loop lifecycle and observation
+    uv-init! uv-poll! uv-wakeup! uv-in-callback? uv-loop-handle
+    uv-live-handle-count uv-strerror check now-ms now-ns
+    ;; the leases and the read buffer's constants
+    uv-sockaddr-lease uv-scratch-lease uv-peername-lease
+    uv-read-buf-base uv-read-buf-size uv-write-scratch-size
+    ;; sizes
+    uv-handle-size uv-req-size tcp-handle-size timer-handle-size
+    write-req-size connect-req-size getaddrinfo-req-size fs-req-size buf-t-size
+    ;; constants
+    UV-RUN-NOWAIT UV-RUN-ONCE UV-TCP UV-TIMER UV-WRITE UV-EOF UV-CONNECT
+    UV-GETADDRINFO UV-FS UV-EINVAL S-IFMT S-IFREG AF-INET uv-enomem
+    O-RDONLY O-DIRECTORY O-NOFOLLOW O-CLOEXEC
+    fs-o-rdonly fs-o-wronly fs-o-creat fs-o-trunc fs-o-excl
+    fs-o-directory fs-o-cloexec
+    ;; raw entry points, used by (igropyr tcp)
+    uv-loop-size uv-loop-init uv-run uv-hrtime uv-ip4-addr
+    uv-tcp-init uv-tcp-connect uv-getaddrinfo uv-freeaddrinfo
+    uv-fs-open uv-fs-read uv-fs-close uv-fs-fstat uv-fs-realpath
+    uv-fs-stat uv-fs-unlink uv-fs-scandir uv-fs-scandir-next
+    uv-fs-get-ptr uv-fs-get-result uv-fs-get-statbuf uv-fs-req-cleanup
+    uv-fs-write uv-fs-fsync uv-fs-rename uv-fs-mkdir
+    uv-tcp-bind uv-tcp-nodelay uv-listen uv-accept
+    uv-read-start uv-read-stop uv-write uv-try-write
+    uv-close uv-is-closing uv-is-active
+    uv-timer-init uv-timer-start uv-timer-stop
+    memcpy-from-c memcpy-to-c memcpy-cc
+    c-open c-openat c-close uv-fileno c-getsockopt)
+
   (import (chezscheme) (igropyr platform))
+
 
   ;; Shared objects must be loaded before the foreign-procedure
   ;; definitions below are evaluated (library body runs in order).
@@ -75,6 +98,28 @@
   (define uv-fs-fstat (foreign-procedure "uv_fs_fstat" (void* void* int void*) int))
   (define uv-fs-realpath
     (foreign-procedure "uv_fs_realpath" (void* void* string void*) int))
+  ;; The three path-only operations. They take no descriptor and open
+  ;; none: uv_fs_scandir's int is its flags word, which libuv ignores.
+  (define uv-fs-stat
+    (foreign-procedure "uv_fs_stat" (void* void* string void*) int))
+  (define uv-fs-unlink
+    (foreign-procedure "uv_fs_unlink" (void* void* string void*) int))
+  (define uv-fs-scandir
+    (foreign-procedure "uv_fs_scandir" (void* void* string int void*) int))
+  ;; Pulls one entry out of a completed scandir request into a caller-owned
+  ;; uv_dirent_t. Returns UV_EOF when the listing is exhausted.
+  (define uv-fs-scandir-next
+    (foreign-procedure "uv_fs_scandir_next" (void* void*) int))
+
+  ;; THE ONLY ERRNO THIS FILE INVENTS. Every other #(file-error ,e)
+  ;; carries a number libuv returned; this one is reported when the
+  ;; scandir callback itself runs out of memory building Scheme strings,
+  ;; a failure libuv never saw and has no code for. It is spelled the way
+  ;; libuv spells it so a consumer's existing errno handling covers it:
+  ;; uv/errno.h defines UV__ENOMEM as UV__ERR(ENOMEM), and UV__ERR(x) is
+  ;; -(x) on everything but Windows, with ENOMEM = 12.
+  (define uv-enomem -12)
+
   (define uv-fs-get-ptr (foreign-procedure "uv_fs_get_ptr" (void*) void*))
   (define uv-fs-get-result (foreign-procedure "uv_fs_get_result" (void*) ssize_t))
   (define uv-fs-get-statbuf (foreign-procedure "uv_fs_get_statbuf" (void*) void*))
@@ -100,6 +145,7 @@
   (define uv-try-write   (foreign-procedure "uv_try_write" (void* void* unsigned-int) int))
   (define uv-close       (foreign-procedure "uv_close" (void* void*) void))
   (define uv-is-closing  (foreign-procedure "uv_is_closing" (void*) int))
+  (define uv-is-active   (foreign-procedure "uv_is_active" (void*) int))
   (define uv-strerror    (foreign-procedure "uv_strerror" (int) string))
   (define uv-timer-init  (foreign-procedure "uv_timer_init" (void* void*) int))
   (define uv-timer-start (foreign-procedure "uv_timer_start" (void* void* unsigned-64 unsigned-64) int))
@@ -110,6 +156,9 @@
   (define c-open          (foreign-procedure "open" (string int int) int))
   (define c-openat        (foreign-procedure "openat" (int string int int) int))
   (define c-close         (foreign-procedure "close" (int) int))
+  (define uv-fileno       (foreign-procedure "uv_fileno" (void* void*) int))
+  (define c-getsockopt    (foreign-procedure "getsockopt"
+                            (int int int void* void*) int))
 
   (define UV-CONNECT 2)
   (define UV-GETADDRINFO 8)
@@ -212,209 +261,16 @@
   ;; (see now-ms), so a difference of two is exact and allocation-free.
   (define (now-ns) (uv-hrtime))
 
+  ;; walk the addrinfo linked list, return the first IPv4 as "a.b.c.d".
+  ;; Supported LP64 addrinfo layouts share ai_family @ 4 and ai_next @ 40;
+  ;; ai_addr is selected by (igropyr platform). sockaddr_in.sin_addr @ 4.
+  (define AF-INET 2)
+
   (define (check who r)
     (if (< r 0)
         (error who (uv-strerror r))
         r))
 
-  ;; connection record; one per accepted TCP client
-  (define-record-type (conn make-conn conn?)
-    (fields
-      (immutable handle conn-handle)             ; foreign address of uv_tcp_t
-      (mutable owner conn-owner conn-set-owner-field!) ; pid of the reader process
-      (mutable state conn-state conn-set-state!) ; open | closing | closed
-      ;; one thunk, run exactly once when the handle's close completes --
-      ;; see conn-on-close! below for why cleanup hangs off the conn
-      (mutable cleanup conn-cleanup conn-set-cleanup!)))
-
-  ;; GC roots (the "keep-live" story):
-  ;; - conn-table roots every live connection's Scheme state while libuv
-  ;;   holds the raw handle pointer; doubles as fd-leak accounting.
-  ;; - write-table roots write-completion closures until the write_cb runs.
-  ;; - locked-callbacks below roots the foreign-callable code objects; if
-  ;;   the accept callback were collected, the next connection would jump
-  ;;   into freed memory -- the classic crash under high concurrency.
-  (define conn-table (make-eqv-hashtable))
-  (define write-table (make-eqv-hashtable))
-  ;; pending outbound connects: req address -> (handle . owner-pid)
-  (define connect-table (make-eqv-hashtable))
-  ;; pending DNS lookups: getaddrinfo req address -> owner-pid
-  (define getaddrinfo-table (make-eqv-hashtable))
-  ;; pending async file reads: fs req address -> fs-op record
-  (define fs-table (make-eqv-hashtable))
-  (define (conn-count) (hashtable-size conn-table))
-
-  ;; delivery hook: (deliver owner-pid msg); installed by (igropyr actor)
-  (define deliver (lambda (owner msg) (void)))
-  (define (uv-set-deliver! proc) (set! deliver proc))
-
-  ;; owner pid -> list of resources it may own. This is an INDEX, not the
-  ;; truth: entries are added when ownership is established and never
-  ;; removed on release, so the list is a superset and every candidate is
-  ;; re-checked against the real owner before anything is closed. That
-  ;; asymmetry is deliberate -- a stale entry costs one failed check, while
-  ;; a MISSING entry would silently skip a resource that had to be freed,
-  ;; and conn-set-owner! is exported, so ownership can move at any time.
-  ;;
-  ;; It exists because uv-owner-died! runs on EVERY process death, and
-  ;; scanning four global tables there made each death cost O(all open
-  ;; connections): measured at 34.5 us with none and 67.5 us with 6000, so
-  ;; a busy server paid for its own concurrency on every request that
-  ;; ended. The two quantities that grow under load were multiplying.
-  (define owner-index (make-eq-hashtable))
-
-  (define (index-owner! owner kind key)
-    (when owner
-      (hashtable-set! owner-index owner
-        (cons (cons kind key) (hashtable-ref owner-index owner '())))))
-
-  ;; Drop an entry when the resource is finished with.
-  ;;
-  ;; Leaving them was defensible while a stale entry only cost a failed
-  ;; re-check -- but the list is per OWNER, and an owner can be long-lived.
-  ;; A process that reconnects, resolves and reads files for days
-  ;; accumulated one entry per operation it ever performed, held for the
-  ;; life of that process, and then walked every one of them inside a
-  ;; no-interrupts region when it finally died. Removal keeps the cost
-  ;; proportional to what is OPEN rather than to what has ever happened.
-  ;;
-  ;; Still a superset, not the truth: a resource handed on to another owner
-  ;; leaves its entry behind under the old one, and uv-owner-died! re-checks
-  ;; every candidate against the real owner before touching it.
-  (define (unindex-owner! owner kind key)
-    (when owner
-      (let ((xs (hashtable-ref owner-index owner '())))
-        (unless (null? xs)
-          (let ((rest (remp (lambda (e)
-                              (and (eq? (car e) kind) (equal? (cdr e) key)))
-                            xs)))
-            (if (null? rest)
-                (hashtable-delete! owner-index owner)
-                (hashtable-set! owner-index owner rest)))))))
-
-  ;; Ownership is public and mutable -- an application hands a conn to the
-  ;; process that will read it, and may hand it on again. The index has to
-  ;; learn about every such move, so the setter is the hook rather than the
-  ;; raw record field. The old owner's entry is left behind on purpose: it
-  ;; becomes a stale candidate, which costs one failed re-check, whereas
-  ;; forgetting to add the new one would skip a live resource at teardown.
-  ;; The field and the index entry are ONE step. A safe point between them
-  ;; is a window in which the new owner can die: uv-owner-died! for that pid
-  ;; then finds no entry and skips the resource, and the entry that arrives
-  ;; afterwards names a process already gone -- nothing will ever reclaim
-  ;; it. Same family as the enqueue-write! and conn-on-close! windows.
-  (define (conn-set-owner! c owner)
-    (with-interrupts-disabled
-      (conn-set-owner-field! c owner)
-      (index-owner! owner 'conn (conn-handle c))))
-
-  ;; Reclaim what a dead owner can no longer close itself. A killed
-  ;; process does not run its dynamic-wind winders (see actor.sc @kill),
-  ;; so a handler killed mid-download would otherwise leak its open fd,
-  ;; its 256 KiB foreign chunk buffer and the uv_fs_t for the life of
-  ;; the VM -- fs-table roots them, so the GC cannot help. The actor
-  ;; layer calls this from its process-teardown path.
-  (define (uv-owner-died! owner)
-    (with-interrupts-disabled
-      (let ((owned (hashtable-ref owner-index owner '())))
-        (hashtable-delete! owner-index owner)
-        (for-each
-          (lambda (entry)
-            (let ((kind (car entry)) (key (cdr entry)))
-              (case kind
-                ;; conn-table is the GC root for both the Scheme record and
-                ;; the libuv handle, so leaving one here leaks an fd for the
-                ;; lifetime of the VM. Re-check the owner: the index may name
-                ;; a conn this process handed on to someone else.
-                ((conn)
-                 (let ((c (hashtable-ref conn-table key #f)))
-                   (when (and c (eq? (conn-owner c) owner)) (tcp-close! c))))
-                ;; A DESCRIPTOR THE DEAD PROCESS STILL HELD. The write
-                ;; side hands fds back to the caller and takes them again
-                ;; one syscall at a time, so a process that dies between
-                ;; two of its own calls leaves one open with nobody left
-                ;; to close it. Closed synchronously here: the fd is
-                ;; already ours to release and there is no one to tell.
-                ;;
-                ;; IT IS A RESOURCE BACKSTOP, NOT A TRANSACTION. What the
-                ;; descriptor pointed at may be a half-written file, and
-                ;; that is left exactly as it lies -- nothing here
-                ;; truncates, deletes or rolls anything back. Reconciling
-                ;; a partial write is the caller's protocol, and reading
-                ;; this as "the framework tidied up" would be reading it
-                ;; as the one thing it does not do.
-                ((fsfd)
-                 (let ((e (hashtable-ref fsw-fds key #f)))
-                   (when (and e (eq? (car e) owner))
-                     (let ((gen (cdr e)))
-                     (hashtable-delete! fsw-fds key)
-                     ;; A RECLAIM MUST COME AFTER THE LAST JOB THAT NAMES
-                     ;; IT, or what gets closed is a NUMBER and not a
-                     ;; file. A job already handed to the pool has not
-                     ;; necessarily entered its syscall yet: close the
-                     ;; descriptor here and the number can be reissued to
-                     ;; something else before that thread runs, at which
-                     ;; point a late write lands in an unrelated file and
-                     ;; a late close shuts one. Owner death does not
-                     ;; cancel jobs -- it only stops their answers being
-                     ;; delivered -- so the wait is real and has to be
-                     ;; waited out.
-                     ;;
-                     ;; THIS COVERS THE CLOSES THIS LIBRARY ISSUES -- the
-                     ;; reclaim here and the orphaned-open return -- and
-                     ;; not a close the CALLER submits. Ordering its own
-                     ;; close after its own outstanding jobs on the same
-                     ;; descriptor is the caller's, exactly as it is in C:
-                     ;; one thread writing a descriptor while another
-                     ;; closes it races the same reissue, and no
-                     ;; descriptor API promises otherwise. (igropyr
-                     ;; durable-async) is the worked example -- it keeps
-                     ;; one job in flight at a time, so the question never
-                     ;; arises for it.
-                     (if (fd-in-flight? key)
-                         (hashtable-set! fsw-closing key gen)
-                         (close-fd-now! key))))))
-                ;; An in-flight job: the callback is still coming and
-                ;; still has to free the request, so only the delivery is
-                ;; suppressed. Clearing the owner is what does that --
-                ;; the callback checks it before delivering. Deleting the
-                ;; entry instead would lose the record that this request
-                ;; is outstanding.
-                ((fsjob)
-                 (let ((j (hashtable-ref fsw-table key #f)))
-                   (when (and j (eq? (fsw-job-owner j) owner))
-                     (fsw-job-owner-set! j #f))))
-                ;; A connect request cannot be synchronously cancelled on
-                ;; every supported libuv. Clear its owner instead; on-connect
-                ;; then closes a late successful handle rather than
-                ;; registering it for a dead pid.
-                ((connect)
-                 (let ((e (hashtable-ref connect-table key #f)))
-                   (when (and e (eq? (cdr e) owner)) (set-cdr! e #f))))
-                ;; DNS has no handle to close. Suppress its eventual delivery
-                ;; while RETAINING the request entry so the callback still
-                ;; frees it. Do NOT "simplify" this into a hashtable-delete!:
-                ;; on-getaddrinfo runs either way and does the foreign-free,
-                ;; so dropping the key here only loses the record that this
-                ;; request is still outstanding. Setting #f is safe because
-                ;; both delivery sites are guarded by (when owner ...).
-                ((dns)
-                 (when (eq? (hashtable-ref getaddrinfo-table key #f) owner)
-                   (hashtable-set! getaddrinfo-table key #f)))
-                ;; an fs op holds an open fd, a 256 KiB foreign chunk buffer
-                ;; and the uv_fs_t; fs-table roots them, so the GC cannot help
-                ((fs)
-                 (let ((op (hashtable-ref fs-table key #f)))
-                   (when (and op (eq? (fs-op-owner op) owner))
-                     (file-stream-close! op))))
-                (else (void)))))
-          owned))))
-
-  ;; live listeners: handle address -> accept hook, one entry per
-  ;; tcp-listen!. Keyed dispatch (not a single global) so several
-  ;; servers can listen on different ports in one process; the table
-  ;; also roots the listener handles for the GC.
-  (define listener-table (make-eqv-hashtable))
 
   ;; global libuv state, allocated in uv-init!
   (define uv-loop 0)
@@ -430,376 +286,26 @@
   (define write-scratch-size 65536)
   (define scratch-buf 0)             ; one reusable uv_buf_t
 
-  ;; ---- callbacks ----------------------------------------------------
 
-  ;; alloc_cb: hand libuv one shared static buffer. Safe because libuv
-  ;; is single-threaded and calls alloc_cb immediately before each
-  ;; read_cb; the data is copied out before the next read.
-  (define on-alloc-code
+  ;; ARE WE IN A CALLBACK FRAME? Set around uv_run, which is the only place
+  ;; libuv callbacks run from. This is used instead of comparing pids against
+  ;; the event-loop process: it is the direct mechanism rather than an identity
+  ;; test standing in for one, and it needs no second hook to tell us which pid
+  ;; the loop is.
+  (define in-uv-run? #f)
+
+  ;; walk_cb: counts. uv_walk is the only way to ask libuv how many
+  ;; handles the loop is holding, and that question has no answer
+  ;; anywhere on the Scheme side -- a handle that was initialised and
+  ;; then abandoned is in no table here, so nothing short of asking the
+  ;; loop can see it. Without this, "the handle is not leaked" is a
+  ;; sentence with no measurement behind it.
+  (define walk-tally 0)
+
+  (define on-walk-code
     (foreign-callable
-      (lambda (handle suggested buf)
-        (foreign-set! 'void* buf 0 read-buf)
-        (foreign-set! 'unsigned-64 buf 8 read-buf-size))
-      (void* size_t void*)
-      void))
-
-  ;; read_cb: copy bytes into a fresh bytevector and deliver to the
-  ;; connection's owner process. Errors/EOF are delivered as messages,
-  ;; never raised.
-  (define on-read-code
-    (foreign-callable
-      (lambda (stream nread buf)
-        (let ((c (hashtable-ref conn-table stream #f)))
-          (when (and c (conn-owner c))
-            (cond
-              ((> nread 0)
-               (let ((bv (make-bytevector nread)))
-                 (memcpy-from-c bv (foreign-ref 'void* buf 0) nread)
-                 (deliver (conn-owner c) (vector 'tcp-data bv))))
-              ((= nread 0) (void))   ; spurious wakeup; ignore
-              ((= nread UV-EOF)
-               (deliver (conn-owner c) (vector 'tcp-eof)))
-              (else
-               (deliver (conn-owner c) (vector 'tcp-error nread)))))))
-      (void* ssize_t void*)
-      void))
-
-  ;; close_cb: the single place where handle memory is freed.
-  (define on-close-code
-    (foreign-callable
-      (lambda (handle)
-        (let ((c (hashtable-ref conn-table handle #f)))
-          (hashtable-delete! conn-table handle)
-          (when c
-            (unindex-owner! (conn-owner c) 'conn handle)
-            (conn-set-state! c 'closed)
-            (let ((clean (conn-cleanup c)))
-              (when clean
-                (conn-set-cleanup! c #f)
-                ;; callback context: an escaping raise would unwind into C
-                (guard (e (#t (void))) (clean))))))
-        (foreign-free handle))
-      (void*)
-      void))
-
-  ;; write_cb: run the stored completion closure, free the whole
-  ;; [uv_write_t][uv_buf_t][payload] block in one shot.
-  (define on-write-code
-    (foreign-callable
-      (lambda (req status)
-        (let ((done (hashtable-ref write-table req #f)))
-          (hashtable-delete! write-table req)
-          (foreign-free req)
-          (when done (done status))))
-      (void* int)
-      void))
-
-  ;; connection_cb: accept, register, hand the conn to the upper layer.
-  ;; Accept errors are swallowed; the listener must stay alive.
-  (define on-connection-code
-    (foreign-callable
-      (lambda (server status)
-        (when (>= status 0)
-          (let ((client (foreign-alloc tcp-handle-size)))
-            (uv-tcp-init uv-loop client)
-            (if (< (uv-accept server client) 0)
-                (uv-close client on-close-entry)
-                (let ((c (make-conn client #f 'open #f))
-                      (p (hashtable-ref listener-table server #f)))
-                  (uv-tcp-nodelay client 1)
-                  (hashtable-set! conn-table client c)
-                  (if p
-                      (p c)
-                      ;; listener already stopped: refuse the straggler
-                      (tcp-close! c)))))))
-      (void* int)
-      void))
-
-  ;; walk the addrinfo linked list, return the first IPv4 as "a.b.c.d".
-  ;; Supported LP64 addrinfo layouts share ai_family @ 4 and ai_next @ 40;
-  ;; ai_addr is selected by (igropyr platform). sockaddr_in.sin_addr @ 4.
-  (define AF-INET 2)
-  (define (addrinfo->ipv4 ai)
-    (let loop ((ai ai))
-      (if (= ai 0)
-          #f
-          (if (= (foreign-ref 'int ai 4) AF-INET)
-              (let ((sa (foreign-ref 'void* ai addrinfo-address-offset)))
-                (string-append
-                  (number->string (foreign-ref 'unsigned-8 sa 4)) "."
-                  (number->string (foreign-ref 'unsigned-8 sa 5)) "."
-                  (number->string (foreign-ref 'unsigned-8 sa 6)) "."
-                  (number->string (foreign-ref 'unsigned-8 sa 7))))
-              (loop (foreign-ref 'void* ai addrinfo-next-offset))))))
-
-  ;; Async file reads as an open -> fstat -> bounded read -> close
-  ;; chain, all on libuv's thread pool. Two modes share the machinery:
-  ;;   whole  -- accumulate every chunk, deliver #(file-read ,body) once
-  ;;             (file-read-async!)
-  ;;   stream -- deliver one #(file-chunk ,bv) per read and park until
-  ;;             the consumer pulls again (file-stream-read!): flow
-  ;;             control is the consumer's write pace, so a large file
-  ;;             is served in constant memory (one chunk in flight).
-  ;;             With file-stream-raw! the chunk STAYS in the op's C
-  ;;             buffer and only its length is delivered -- the consumer
-  ;;             sends it with tcp-write-foreign! (buffer -> kernel, no
-  ;;             per-chunk Scheme allocation, no GC traffic).
-  (define file-read-chunk-size 65536)
-  ;; stream reads use bigger chunks: fewer thread-pool round trips per
-  ;; GB; memory per in-flight download is still just one chunk
-  (define stream-chunk-size 262144)
-
-  (define-record-type (fs-op make-fs-op fs-op?)
-    (fields
-      (mutable owner fs-op-owner fs-op-owner-set!)   ; delivery target pid
-      (immutable path fs-op-path)
-      (immutable mode fs-op-mode)                    ; whole | stream
-      (immutable req fs-op-req)                      ; uv_fs_t address
-      (mutable phase fs-op-phase fs-op-phase-set!)   ; open|fstat|idle|read|close
-      (mutable aborted? fs-op-aborted? fs-op-aborted?-set!)
-      (mutable raw? fs-op-raw? fs-op-raw?-set!)      ; deliver lengths, not bvs
-      (mutable fd fs-op-fd fs-op-fd-set!)
-      (mutable size fs-op-size fs-op-size-set!)
-      (mutable offset fs-op-offset fs-op-offset-set!)
-      (mutable chunks fs-op-chunks fs-op-chunks-set!)
-      (mutable data fs-op-data fs-op-data-set!)       ; C read buffer
-      (mutable buf fs-op-buf fs-op-buf-set!)))         ; uv_buf_t
-
-  (define (fs-chunk-cap op)
-    (if (eq? (fs-op-mode op) 'stream) stream-chunk-size file-read-chunk-size))
-
-  (define (fs-body op)
-    (let ((out (make-bytevector (fs-op-offset op))))
-      (let loop ((xs (reverse (fs-op-chunks op))) (off 0))
-        (unless (null? xs)
-          (let ((bv (car xs)))
-            (bytevector-copy! bv 0 out off (bytevector-length bv))
-            (loop (cdr xs) (+ off (bytevector-length bv))))))
-      out))
-
-  (define (fs-cleanup! op req)
-    (when (> (fs-op-data op) 0) (foreign-free (fs-op-data op)))
-    (when (> (fs-op-buf op) 0) (foreign-free (fs-op-buf op)))
-    (unindex-owner! (fs-op-owner op) 'fs req)
-    (hashtable-delete! fs-table req)
-    (foreign-free req))
-
-  (define (fs-fail! op req errno)
-    ;; if a fd is open, close it (fire-and-forget) before reporting
-    (when (>= (fs-op-fd op) 0)
-      (let ((creq (foreign-alloc fs-req-size)))
-        (uv-fs-close uv-loop creq (fs-op-fd op) 0)   ; sync close, ignore
-        (uv-fs-req-cleanup creq)
-        (foreign-free creq)))
-    (deliver (fs-op-owner op) (vector 'file-error errno))
-    (fs-cleanup! op req))
-
-  (define (regular-file-mode? mode)
-    (= (bitwise-and mode S-IFMT) S-IFREG))
-
-  ;; Deliver the completion and release the op. Reached only after
-  ;; every read completed, so a close error (rare; e.g. NFS) must not
-  ;; discard the data -- success is reported regardless of how close
-  ;; went. whole mode reports the accumulated body; stream mode reports
-  ;; end-of-stream; an aborted stream reports nothing.
-  (define (fs-finish! op req)
-    (unless (fs-op-aborted? op)
-      (deliver (fs-op-owner op)
-        (if (eq? (fs-op-mode op) 'stream)
-            (vector 'file-eof)
-            (vector 'file-read (fs-body op)))))
-    (fs-cleanup! op req))
-
-  ;; Release an aborted stream: close the fd (if open) reusing the op's
-  ;; req, then free everything. Nothing is delivered.
-  (define (fs-quiet-close! op req)
-    (if (< (fs-op-fd op) 0)
-        (fs-cleanup! op req)
-        (begin
-          (fs-op-phase-set! op 'close)
-          (let ((r (uv-fs-close uv-loop req (fs-op-fd op) on-fs-entry)))
-            (when (< r 0)
-              (uv-fs-req-cleanup req)
-              (let ((creq (foreign-alloc fs-req-size)))
-                (uv-fs-close uv-loop creq (fs-op-fd op) 0)   ; sync close
-                (uv-fs-req-cleanup creq)
-                (foreign-free creq))
-              (fs-cleanup! op req))))))
-
-  ;; A callback fired on a stream that was aborted while the op was in
-  ;; flight: unwind quietly whatever phase it was in.
-  (define (fs-abort-step! op req result)
-    (uv-fs-req-cleanup req)
-    (case (fs-op-phase op)
-      ((close) (fs-cleanup! op req))
-      ((open)
-       (when (>= result 0) (fs-op-fd-set! op result))
-       (fs-quiet-close! op req))
-      (else (fs-quiet-close! op req))))
-
-  (define (start-fs-close! op req)
-    (fs-op-phase-set! op 'close)
-    (let ((r (uv-fs-close uv-loop req (fs-op-fd op) on-fs-entry)))
-      (when (< r 0)
-        ;; could not queue the close: close synchronously instead, and
-        ;; still deliver -- the data was fully read before this point
-        (uv-fs-req-cleanup req)
-        (let ((creq (foreign-alloc fs-req-size)))
-          (uv-fs-close uv-loop creq (fs-op-fd op) 0)   ; sync close, ignore
-          (uv-fs-req-cleanup creq)
-          (foreign-free creq))
-        (fs-finish! op req))))
-
-  (define (start-fs-fstat! op req)
-    (fs-op-phase-set! op 'fstat)
-    (let ((r (uv-fs-fstat uv-loop req (fs-op-fd op) on-fs-entry)))
-      (when (< r 0)
-        (uv-fs-req-cleanup req)
-        (fs-fail! op req r))))
-
-  (define (start-fs-read! op req)
-    (let ((remaining (- (fs-op-size op) (fs-op-offset op))))
-      (if (<= remaining 0)
-          (start-fs-close! op req)
-          (let ((n (min (fs-chunk-cap op) remaining)))
-            (fs-op-phase-set! op 'read)
-            (foreign-set! 'unsigned-64 (fs-op-buf op) 8 n)
-            (let ((r (uv-fs-read uv-loop req (fs-op-fd op) (fs-op-buf op) 1
-                                 (fs-op-offset op) on-fs-entry)))
-              (when (< r 0)
-                (uv-fs-req-cleanup req)
-                (fs-fail! op req r)))))))
-
-  (define on-fs-code
-    (foreign-callable
-      (lambda (req)
-        (let ((op (hashtable-ref fs-table req #f))
-              (result (uv-fs-get-result req)))
-          (when op
-            (if (fs-op-aborted? op)
-                (fs-abort-step! op req result)
-                (case (fs-op-phase op)
-                  ((open)
-                   (uv-fs-req-cleanup req)
-                   (if (< result 0)
-                       (fs-fail! op req result)
-                       (begin
-                         (fs-op-fd-set! op result)
-                         (start-fs-fstat! op req))))
-                  ((fstat)
-                   (if (< result 0)
-                       (begin
-                         (uv-fs-req-cleanup req)
-                         (fs-fail! op req result))
-                       (let* ((st (uv-fs-get-statbuf req))
-                              (mode (foreign-ref 'unsigned-64 st uv-stat-mode-offset))
-                              (size (foreign-ref 'unsigned-64 st uv-stat-size-offset)))
-                         (uv-fs-req-cleanup req)
-                         (fs-op-size-set! op size)
-                         (cond
-                           ((not (regular-file-mode? mode))
-                            (fs-fail! op req UV-EINVAL))
-                           ((eq? (fs-op-mode op) 'stream)
-                            ;; ready: report the size, then park until the
-                            ;; consumer pulls the first chunk
-                            (when (> size 0)
-                              (let* ((data (foreign-alloc (fs-chunk-cap op)))
-                                     (buf (foreign-alloc 16)))
-                                (fs-op-data-set! op data)
-                                (fs-op-buf-set! op buf)
-                                (foreign-set! 'void* buf 0 data)))
-                            (fs-op-phase-set! op 'idle)
-                            (deliver (fs-op-owner op)
-                                     (vector 'file-stream op size)))
-                           ((= size 0)
-                            (start-fs-close! op req))
-                           (else
-                            (let* ((data (foreign-alloc (fs-chunk-cap op)))
-                                   (buf (foreign-alloc 16)))
-                              (fs-op-data-set! op data)
-                              (fs-op-buf-set! op buf)
-                              (foreign-set! 'void* buf 0 data)
-                              (start-fs-read! op req)))))))
-                  ((read)
-                   (uv-fs-req-cleanup req)
-                   (cond
-                     ((< result 0) (fs-fail! op req result))
-                     ((= result 0) (start-fs-close! op req))   ; early EOF
-                     (else
-                      (let* ((remaining (- (fs-op-size op) (fs-op-offset op)))
-                             (n (min result remaining)))
-                        (fs-op-offset-set! op (+ (fs-op-offset op) n))
-                        (cond
-                          ((fs-op-raw? op)
-                           ;; the bytes stay in the op's C buffer; hand
-                           ;; over just the length -- the consumer writes
-                           ;; straight from the buffer, zero Scheme alloc
-                           (fs-op-phase-set! op 'idle)
-                           (deliver (fs-op-owner op) (vector 'file-chunk n)))
-                          ((eq? (fs-op-mode op) 'stream)
-                           ;; hand over one chunk; the next read waits
-                           ;; for the consumer's file-stream-read!
-                           (let ((bv (make-bytevector n)))
-                             (memcpy-from-c bv (fs-op-data op) n)
-                             (fs-op-phase-set! op 'idle)
-                             (deliver (fs-op-owner op) (vector 'file-chunk bv))))
-                          (else
-                           (let ((bv (make-bytevector n)))
-                             (memcpy-from-c bv (fs-op-data op) n)
-                             (fs-op-chunks-set! op (cons bv (fs-op-chunks op)))
-                             (if (>= (fs-op-offset op) (fs-op-size op))
-                                 (start-fs-close! op req)
-                                 (start-fs-read! op req)))))))))
-                  ((close)
-                   (uv-fs-req-cleanup req)
-                   (fs-finish! op req)))))))
-      (void*)
-      void))
-
-  ;; getaddrinfo_cb: tell the owner #(dns-resolved ,ip) or #(dns-failed ,e)
-  (define on-getaddrinfo-code
-    (foreign-callable
-      (lambda (req status ai)
-        (let ((owner (hashtable-ref getaddrinfo-table req #f)))
-          (hashtable-delete! getaddrinfo-table req)
-          (foreign-free req)
-          (if (< status 0)
-              (when owner (deliver owner (vector 'dns-failed status)))
-              (let ((ip (addrinfo->ipv4 ai)))
-                (uv-freeaddrinfo ai)
-                (when owner
-                  (deliver owner
-                    (if ip (vector 'dns-resolved ip) (vector 'dns-failed -1))))))))
-      (void* int void*)
-      void))
-
-  ;; connect_cb for outbound connections: register the conn and tell the
-  ;; owner process #(tcp-connected ,conn) or #(tcp-connect-failed ,errno).
-  (define on-connect-code
-    (foreign-callable
-      (lambda (req status)
-        (let ((entry (hashtable-ref connect-table req #f)))
-          (hashtable-delete! connect-table req)
-          (foreign-free req)
-          (when entry
-            (let ((handle (car entry)) (owner (cdr entry)))
-              (cond
-                ((< status 0)
-                 (uv-close handle on-close-entry)
-                 (when owner (deliver owner (vector 'tcp-connect-failed status))))
-                ((not owner)
-                 ;; The owner died while connect was in flight.
-                 (uv-close handle on-close-entry))
-                (else
-                 (let ((c (make-conn handle owner 'open #f)))
-                   ;; index and table together: an owner dying between them
-                   ;; is told about a conn that teardown cannot find
-                   (with-interrupts-disabled
-                     (index-owner! owner 'conn handle)
-                     (uv-tcp-nodelay handle 1)
-                     (hashtable-set! conn-table handle c))
-                   (deliver owner (vector 'tcp-connected c)))))))))
-      (void* int)
+      (lambda (handle arg) (set! walk-tally (fx+ walk-tally 1)))
+      (void* void*)
       void))
 
   ;; timer_cb for the poll wakeup timer: exists only to bound the
@@ -810,384 +316,47 @@
       (void*)
       void))
 
-  ;; Lock the callback code objects forever: libuv holds raw entry-point
-  ;; pointers into them for the whole process lifetime.
 
-  ;; ---- fs write side: one syscall per job -------------------------------
-  ;;
-  ;; DELIBERATELY NOT THE SHAPE OF THE READ SIDE ABOVE. That one hides a
-  ;; composite sequence -- open, fstat, read, close -- behind a phase
-  ;; machine and delivers once at the end, which is right when the library
-  ;; owns the whole sequence. Here the caller owns it: a durable write is
-  ;; write, flush, rename, flush the directory, and which of those to do,
-  ;; in what order, and what to do when one fails are the caller's
-  ;; decisions. So each job is one syscall, and the caller awaits them in
-  ;; its own green process.
-  ;;
-  ;; WHAT THIS BUYS is the only reason it exists: the syscall runs on a
-  ;; libuv thread-pool thread, so the scheduler keeps running. The
-  ;; synchronous equivalents stop every green process in the runtime for
-  ;; the duration -- measured elsewhere in this tree at 641ms for one
-  ;; call on a busy filesystem.
-  ;;
-  ;; THE POOL IS SHARED AND SMALL. Four threads by default, shared with
-  ;; DNS, and UV_THREADPOOL_SIZE is read once when the pool is first used
-  ;; -- so it must be set in the environment before the process starts,
-  ;; not from inside it. Enough concurrent file jobs will queue behind
-  ;; each other and behind name resolution.
-  ;;
-  ;; The sequence a durable write needs is plain POSIX. ZFS honours it
-  ;; with stronger semantics rather than weaker (the flush goes through
-  ;; the intent log, rename is transactional, and the directory flush
-  ;; degrades to a harmless no-op), so nothing here probes for a
-  ;; filesystem or branches on one.
-  (define fsw-table (make-eqv-hashtable))
-
-  ;; fd -> owner, for the death cleanup below. A descriptor opened here
-  ;; belongs to the caller between calls, which is what "one syscall per
-  ;; job" means -- and a caller that dies holding one would otherwise
-  ;; leak it with no signal at all. That silent shape is the one this
-  ;; library keeps removing; it is not going to be reintroduced by a new
-  ;; entry point.
-  ;; fd -> (owner . gen); see the generation note further down for why
-  ;; the owner alone is not enough to identify a descriptor.
-  (define fsw-fds (make-eqv-hashtable))
-
-  (define fsw-next-id 0)
-
-  (define (fsw-fresh-id!)
-    (set! fsw-next-id (+ fsw-next-id 1))
-    fsw-next-id)
-
-  (define-record-type (fsw-job make-fsw-job fsw-job?)
-    (fields
-      (immutable id fsw-job-id)
-      (mutable owner fsw-job-owner fsw-job-owner-set!)
-      (immutable kind fsw-job-kind)         ; open|write|fsync|rename|close
-      (immutable fd fsw-job-fd)             ; the fd acted on, or -1
-      ;; WHICH TENANCY OF THAT NUMBER THIS JOB MEANT. Captured when the
-      ;; job is submitted; see the generation note below.
-      (mutable gen fsw-job-gen fsw-job-gen-set!)
-      (mutable data fsw-job-data fsw-job-data-set!)   ; C copy of the bytes
-      (mutable buf fsw-job-buf fsw-job-buf-set!)))    ; uv_buf_t
-
-  (define (fsw-count) (hashtable-size fsw-table))
-  (define (fs-job-count) (fsw-count))
-
-  ;; HOW MANY DESCRIPTORS THIS SIDE IS HOLDING FOR CALLERS. Without it
-  ;; the death cleanup above is code that was reviewed rather than
-  ;; behaviour that is watched: a test can kill a process holding an fd,
-  ;; but with nothing to read it cannot tell a close that happened from
-  ;; one that did not. Approximate in the same sense as the job count --
-  ;; it is read outside any lock and a job in flight may be about to
-  ;; change it.
-  (define (fs-fd-count) (hashtable-size fsw-fds))
-
-  ;; Hand a descriptor back to the kernel with no owner to tell. Used
-  ;; both when an owner dies and when one dies before its open finishes.
-  ;; ITS RESULT IS NOT READ, and the two callers say "closed" on the
-  ;; strength of that. If this close fails and the OS still holds the
-  ;; descriptor, it is now off every book here and nothing will reclaim
-  ;; it -- the same unrepairable leak the asynchronous close branch
-  ;; already admits to, reached a different way. Retrying is not the
-  ;; repair: POSIX leaves the descriptor's state unspecified after a
-  ;; failed close, so a second attempt can reach a number that has since
-  ;; been reissued.
-  (define (close-fd-now! fd)
-    (let ((creq (foreign-alloc fs-req-size)))
-      (uv-fs-close uv-loop creq fd 0)
-      (uv-fs-req-cleanup creq)
-      (foreign-free creq)))
-
-  ;; Descriptors whose owner has died while a job still refers to them.
-  ;; See uv-owner-died!: closing one while a pool thread is about to act
-  ;; on it closes a NUMBER, not a file.
-  (define fsw-closing (make-eqv-hashtable))
-
-  ;; HOW MANY IN-FLIGHT JOBS NAME EACH DESCRIPTOR. Counted rather than
-  ;; searched: the question is asked once per descriptor when an owner
-  ;; dies and again on every completion of a job that named a marked one,
-  ;; and a scan of the whole job table each time is quadratic in the
-  ;; queue. That work would happen inside owner teardown and inside
-  ;; event-loop callbacks -- both places where nothing else in the
-  ;; runtime can run -- so a deep queue would turn a bookkeeping question
-  ;; into a pause.
-  ;; A FILE DESCRIPTOR NUMBER IS A LEASE FROM THE OS, NOT AN IDENTITY.
-  ;; The kernel reissues the smallest free number, so the same integer
-  ;; names a different file the moment one is closed. Anything of ours
-  ;; keyed only by that integer will eventually be asked about a tenancy
-  ;; it was not talking about -- a close callback arriving after the
-  ;; number has been handed to a new open would strike that new
-  ;; registration off the books, and the descriptor it belongs to could
-  ;; then never be reclaimed.
-  ;;
-  ;; So identity here is the number PLUS a generation: fsw-fds holds
-  ;; (owner . gen), and each job captures the generation current when it
-  ;; was submitted.
-  ;;
-  ;; WHAT EVERY REMOVAL SITE HAS IN COMMON is the intent -- establish
-  ;; that the entry on the books is the one this code is talking about
-  ;; before touching it. WHAT DIFFERS is the test, because they are
-  ;; answering different questions:
-  ;;
-  ;;   a completion that arrives late  compares the GENERATION
-  ;;                                   -- "is this still the tenancy I
-  ;;                                      acted on?"
-  ;;   the owner-death reclaim         compares the OWNER
-  ;;                                   -- "is this descriptor mine to
-  ;;                                      take back?", which a
-  ;;                                      generation cannot answer
-  ;;
-  ;; Stating it as one uniform rule was the earlier wording here, and it
-  ;; was wrong about the reclaim; the intent is shared, the test is not.
-  ;; None of this reaches the public surface -- the primitives still take
-  ;; and return plain descriptors.
-  (define fsw-gen 0)
-  (define (fsw-next-gen!)
-    (set! fsw-gen (+ fsw-gen 1))
-    fsw-gen)
-
-  (define (fd-gen fd)
-    (let ((e (hashtable-ref fsw-fds fd #f)))
-      (and e (cdr e))))
-
-  (define fsw-fd-refs (make-eqv-hashtable))
-
-  (define (fd-ref+! fd)
-    (when (>= fd 0)
-      (hashtable-set! fsw-fd-refs fd (+ 1 (hashtable-ref fsw-fd-refs fd 0)))))
-
-  (define (fd-ref-! fd)
-    (when (>= fd 0)
-      (let ((n (- (hashtable-ref fsw-fd-refs fd 0) 1)))
-        (if (<= n 0)
-            (hashtable-delete! fsw-fd-refs fd)
-            (hashtable-set! fsw-fd-refs fd n)))))
-
-  (define (fd-in-flight? fd)
-    (> (hashtable-ref fsw-fd-refs fd 0) 0))
-
-  ;; Called once a job has been removed from the table: if it was the
-  ;; last one holding a descriptor that was waiting to be closed, this is
-  ;; the moment the close is finally safe.
-  (define (close-if-drained! fd gen)
-    (let ((marked (and (>= fd 0) (hashtable-ref fsw-closing fd #f))))
-      (when (and marked (eqv? marked gen) (not (fd-in-flight? fd)))
-        (hashtable-delete! fsw-closing fd)
-        (close-fd-now! fd))))
-
-  (define (fsw-free! job req)
-    (fd-ref-! (fsw-job-fd job))
-    (when (> (fsw-job-data job) 0) (foreign-free (fsw-job-data job)))
-    (when (> (fsw-job-buf job) 0) (foreign-free (fsw-job-buf job)))
-    (unindex-owner! (fsw-job-owner job) 'fsjob req)
-    (hashtable-delete! fsw-table req)
-    (uv-fs-req-cleanup req)
-    (foreign-free req))
-
-  ;; A job whose owner died is completed and dropped rather than
-  ;; delivered: the callback still runs, and it still has to free the
-  ;; request and the copied bytes.
-  (define on-fsw-code
-    (foreign-callable
-      (lambda (req)
-        (let ((job (hashtable-ref fsw-table req #f)))
-          (when job
-            (let ((rc (uv-fs-get-result req))
-                  (owner (fsw-job-owner job)))
-              ;; an open that succeeded hands the caller a descriptor, so
-              ;; it goes on the books; a close takes it off whether it
-              ;; succeeded or not, for the reason spelled out on that
-              ;; branch
-              (case (fsw-job-kind job)
-                ((open)
-                 (cond
-                   ((< rc 0) (void))
-                   (owner
-                    (hashtable-set! fsw-fds rc (cons owner (fsw-next-gen!)))
-                    (index-owner! owner 'fsfd rc))
-                   ;; AN OPEN THAT SUCCEEDED FOR A CALLER THAT IS GONE.
-                   ;; Nobody will ever be told this descriptor exists, so
-                   ;; it can never be closed by anyone: the owner sweep
-                   ;; has already run and found nothing, and it is not on
-                   ;; the books to be found later. The only correct thing
-                   ;; to do with it is give it straight back.
-                   (else (close-fd-now! rc))))
-                ((close)
-                 (let* ((fd (fsw-job-fd job))
-                        (e (hashtable-ref fsw-fds fd #f)))
-                   ;; ONLY IF THE BOOKS STILL MEAN THE FILE WE CLOSED.
-                   ;; A callback that arrives after the number has been
-                   ;; reissued would otherwise strike off a registration
-                   ;; belonging to a live owner, whose descriptor could
-                   ;; then never be reclaimed.
-                   (when (and e (eqv? (cdr e) (fsw-job-gen job)))
-                     (hashtable-delete! fsw-fds fd)
-                     (unindex-owner! owner 'fsfd fd))
-                   ;; STRUCK OFF WHETHER OR NOT IT CLOSED. On success it
-                   ;; is closed and anything waiting to close it must not
-                   ;; close the number again. On failure POSIX leaves the
-                   ;; descriptor's state unspecified, and trying again can
-                   ;; reach a number that has since been reissued -- so
-                   ;; there is nothing safe left to do with it either. The
-                   ;; books are cleared in both cases because in neither
-                   ;; case may this side touch the number again; on the
-                   ;; failing one that means a descriptor the OS may still
-                   ;; hold is no longer tracked, which is a real leak with
-                   ;; no safe repair from here.
-                   (let ((marked (hashtable-ref fsw-closing fd #f)))
-                     (when (and marked (eqv? marked (fsw-job-gen job)))
-                       (hashtable-delete! fsw-closing fd)))))
-                (else (void)))
-              (when owner
-                (deliver owner (vector 'fs-done (fsw-job-id job) rc)))
-              (let ((fd (fsw-job-fd job)) (gen (fsw-job-gen job)))
-                (fsw-free! job req)
-                ;; After the job leaves the table, so this cannot see
-                ;; itself as a reason to keep waiting.
-                (close-if-drained! fd gen))))))
-      (void*) void))
-
-  ;; Submit one job. The id comes back at once and names the completion;
-  ;; without it two jobs from the same process would arrive as the same
-  ;; message and could not be told apart.
-  ;; REGISTERING AND SUBMITTING ARE ONE ACT. Between the table entry and
-  ;; the call that hands the request to libuv, this process can be
-  ;; preempted and killed -- and then its continuation is discarded, `go`
-  ;; never runs, and no callback is ever coming for a job that is on the
-  ;; books. The owner sweep finds that job, waits for a completion that
-  ;; cannot arrive, and everything it names is stranded: the request, the
-  ;; copied bytes, and now the descriptor too, since a job that never
-  ;; completes keeps fd-in-flight? true for ever and the deferred close
-  ;; is never reached. Making the pair indivisible is what stops a job
-  ;; existing that nothing will finish.
-  ;; WHAT THIS REGION DOES NOT COVER. The request block, and for a write
-  ;; the C buffer and the byte-by-byte copy into it, are allocated by the
-  ;; caller of this procedure and therefore BEFORE the region opens. A
-  ;; process killed in the middle of that copy leaks exactly those
-  ;; allocations: nothing has them on any book yet, and the continuation
-  ;; that would free them is gone.
-  ;;
-  ;; Pulling them inside is not the repair it looks like. The copy is
-  ;; proportional to the payload -- a 192 MiB write is tens of
-  ;; milliseconds of it -- and running that with interrupts held would
-  ;; stop every green process for the duration, which is the single
-  ;; thing the asynchronous path exists to avoid. So the region covers
-  ;; what it can cover cheaply: from the moment anything is on the books
-  ;; to the moment the request is in libuv's hands. A descriptor is never
-  ;; stranded by the gap, because the reference count is not incremented
-  ;; until inside; what the gap can lose is C memory.
-  (define (fsw-submit! owner kind fd data buf go)
-    (with-interrupts-disabled
-      (let* ((req (foreign-alloc fs-req-size))
-             (job (make-fsw-job (fsw-fresh-id!) owner kind fd #f data buf)))
-        ;; Captured here, inside the atom that registers the job: which
-        ;; tenancy of this number the job meant.
-        (fsw-job-gen-set! job (fd-gen fd))
-        (hashtable-set! fsw-table req job)
-        (index-owner! owner 'fsjob req)
-        (fd-ref+! fd)
-        (let ((r (guard (e (#t
-                            ;; THE SUBMISSION RAISED, so no callback is
-                            ;; coming for a job that is on the books.
-                            ;; Releasing it here is the whole reason the
-                            ;; failure paths live inside this region: an
-                            ;; exception leaves the tables exactly as it
-                            ;; found them, which is not something the
-                            ;; region gives for free -- interrupts are
-                            ;; restored on the way out, table writes are
-                            ;; not.
-                            (fsw-free! job req)
-                            (raise e)))
-                   (go req))))
-          (if (< r 0)
-              ;; REFUSED BEFORE IT EVER REACHED THE POOL, and released
-              ;; INSIDE the region. Doing this after leaving it left a
-              ;; window of exactly the kind the region was added to
-              ;; close: the job was on the books, the reference was
-              ;; counted, no callback was ever coming, and a caller
-              ;; killed in that window discarded the continuation that
-              ;; was going to clean up -- stranding the request, the
-              ;; bytes, and a descriptor that could then never drain.
-              (begin
-                (when owner
-                  (deliver owner (vector 'fs-done (fsw-job-id job) r)))
-                (fsw-free! job req)
-                (fsw-job-id job))
-              (fsw-job-id job))))))
-
-  (define (fs-open-async! path flags mode owner)
-    (fsw-submit! owner 'open -1 0 0
-      (lambda (req)
-        (uv-fs-open uv-loop req path flags mode on-fsw-entry))))
-
-  ;; THE BYTES ARE COPIED INTO C MEMORY, and that copy is not free on a
-  ;; large payload. It is not avoidable: the collector may move a
-  ;; bytevector, and libuv reads the buffer on a pool thread at a moment
-  ;; nothing here controls.
-  (define (fs-write-async! fd bytes offset owner)
-    (let* ((n (bytevector-length bytes))
-           (data (foreign-alloc (max n 1)))
-           (buf (foreign-alloc 16)))
-      (let loop ((i 0))
-        (when (< i n)
-          (foreign-set! 'unsigned-8 data i (bytevector-u8-ref bytes i))
-          (loop (+ i 1))))
-      (foreign-set! 'void* buf 0 data)
-      (foreign-set! 'unsigned-64 buf 8 n)
-      (fsw-submit! owner 'write fd data buf
-        (lambda (req)
-          (uv-fs-write uv-loop req fd buf 1 offset on-fsw-entry)))))
-
-  (define (fs-fsync-async! fd owner)
-    (fsw-submit! owner 'fsync fd 0 0
-      (lambda (req) (uv-fs-fsync uv-loop req fd on-fsw-entry))))
-
-  (define (fs-rename-async! from to owner)
-    (fsw-submit! owner 'rename -1 0 0
-      (lambda (req) (uv-fs-rename uv-loop req from to on-fsw-entry))))
-
-  (define (fs-close-async! fd owner)
-    (fsw-submit! owner 'close fd 0 0
-      (lambda (req) (uv-fs-close uv-loop req fd on-fsw-entry))))
-
-  ;; No fd and no buffer, like rename: the completion carries only the rc.
-  ;; An existing directory comes back as -EEXIST rather than as an error
-  ;; here, which is what lets a caller treat "already there" as success
-  ;; without a prior stat -- and a prior stat would be a race anyway.
-  (define (fs-mkdir-async! path mode owner)
-    (fsw-submit! owner 'mkdir -1 0 0
-      (lambda (req) (uv-fs-mkdir uv-loop req path mode on-fsw-entry))))
-
+  ;; THE LOCK TABLE IS SPLIT BY OWNERSHIP, NOT MOVED WHOLE. Only these two
+  ;; code objects belong to the loop itself -- its wakeup timer and uv_walk.
+  ;; The other eleven reach into connection and file tables and are locked in
+  ;; (igropyr tcp), beside the state they touch. libuv holds raw entry
+  ;; pointers, so every code object must be locked wherever it lives or the
+  ;; loop jumps into collected code; the invariant is the ORDER -- construct,
+  ;; lock, take the entry point, hand it over -- not any registration with
+  ;; this library, which C never sees.
   (define locked-callbacks
     (begin
-      (lock-object on-alloc-code)
-      (lock-object on-read-code)
-      (lock-object on-close-code)
-      (lock-object on-write-code)
-      (lock-object on-connection-code)
-      (lock-object on-connect-code)
-      (lock-object on-getaddrinfo-code)
-      (lock-object on-fs-code)
-      (lock-object on-fsw-code)
       (lock-object on-timer-code)
-      (vector on-alloc-code on-read-code on-close-code
-              on-write-code on-connection-code on-connect-code
-              on-getaddrinfo-code on-fs-code on-fsw-code
-              on-timer-code)))
+      (lock-object on-walk-code)
+      (vector on-timer-code on-walk-code)))
 
-  (define on-fsw-entry (foreign-callable-entry-point on-fsw-code))
-  (define on-alloc-entry (foreign-callable-entry-point on-alloc-code))
-  (define on-read-entry (foreign-callable-entry-point on-read-code))
-  (define on-close-entry (foreign-callable-entry-point on-close-code))
-  (define on-write-entry (foreign-callable-entry-point on-write-code))
-  (define on-connection-entry (foreign-callable-entry-point on-connection-code))
-  (define on-connect-entry (foreign-callable-entry-point on-connect-code))
-  (define on-getaddrinfo-entry (foreign-callable-entry-point on-getaddrinfo-code))
-  (define on-fs-entry (foreign-callable-entry-point on-fs-code))
   (define on-timer-entry (foreign-callable-entry-point on-timer-code))
+  (define on-walk-entry (foreign-callable-entry-point on-walk-code))
 
-  ;; ---- public API ----------------------------------------------------
+  (define uv-walk-c
+    (foreign-procedure "uv_walk" (void* void* void*) void))
+
+
+
+  ;; Every handle the loop still holds, counted. Includes the internal
+  ;; wakeup timer, so the number is compared against a baseline taken in
+  ;; the same process rather than against zero.
+  ;;
+  ;; A CLOSING HANDLE IS STILL A HANDLE. uv_close is asynchronous: the
+  ;; handle leaves the loop when its close callback runs, which needs the
+  ;; loop to turn. Read this number straight after a close and it counts
+  ;; something that is on its way out, which reads exactly like a leak.
+  ;; A caller measuring "was it released" has to let the loop run first
+  ;; -- a sleep long enough to be sure, and that sleep is waiting for the
+  ;; LOOP, not waiting for a fix to take effect. The first measurement
+  ;; written against this counter got that wrong and reported five leaked
+  ;; handles that were all already closing.
+  (define (uv-live-handle-count)
+    (with-interrupts-disabled
+      (set! walk-tally 0)
+      (uv-walk-c uv-loop on-walk-entry 0)
+      walk-tally))
 
   (define (uv-init!)
     (set! uv-loop (foreign-alloc (uv-loop-size)))
@@ -1205,448 +374,57 @@
   ;; timeout-ms > 0: block in the OS poller until I/O arrives or the
   ;; wakeup timer fires -- zero busy-wait when idle.
   (define (uv-poll! timeout-ms)
-    (if (<= timeout-ms 0)
-        (uv-run uv-loop UV-RUN-NOWAIT)
-        (begin
-          (uv-timer-start wakeup-timer on-timer-entry timeout-ms 0)
-          (uv-run uv-loop UV-RUN-ONCE)
-          (uv-timer-stop wakeup-timer))))
+    (dynamic-wind
+      (lambda () (set! in-uv-run? #t))
+      (lambda ()
+        (if (<= timeout-ms 0)
+            (uv-run uv-loop UV-RUN-NOWAIT)
+            (begin
+              (uv-timer-start wakeup-timer on-timer-entry timeout-ms 0)
+              (uv-run uv-loop UV-RUN-ONCE)
+              (uv-timer-stop wakeup-timer))))
+      (lambda () (set! in-uv-run? #f))))
 
-  ;; optional trailing arg: uv_tcp_bind flags (UV_TCP_REUSEPORT = 2,
-  ;; kernel-balanced multi-process listening; Linux/FreeBSD only)
-  (define (tcp-listen! host port backlog on-accept . opts)
-    (with-interrupts-disabled          ; shared sockaddr-buf: see tcp-connect!
-    (let ((flags (if (pair? opts) (car opts) 0))
-          (l (foreign-alloc tcp-handle-size)))
-      (check 'uv-tcp-init (uv-tcp-init uv-loop l))
-      (check 'uv-ip4-addr (uv-ip4-addr host port sockaddr-buf))
-      (check 'uv-tcp-bind (uv-tcp-bind l sockaddr-buf flags))
-      (check 'uv-listen (uv-listen l backlog on-connection-entry))
-      (hashtable-set! listener-table l on-accept)
-      l)))
 
-  ;; Stop accepting new connections (graceful shutdown step 1);
-  ;; established connections are unaffected. With a listener handle
-  ;; (tcp-listen!'s return value) stops that server only; with no
-  ;; argument stops every listener in the process.
-  (define (tcp-stop-listen! . rest)
-    (define (stop! l)
-      (when (hashtable-ref listener-table l #f)
-        (hashtable-delete! listener-table l)
-        (uv-close l on-close-entry)))
-    (if (pair? rest)
-        (stop! (car rest))
-        (vector-for-each stop! (hashtable-keys listener-table))))
+  ;; -> the loop's address. A procedure and not the variable itself: uv-init!
+  ;; assigns it, and R6RS forbids exporting an assigned variable -- the same
+  ;; rule that put ctx and live-sessions behind accessors in tls-core.
+  (define (uv-loop-handle) uv-loop)
 
-  (define (fs-start! path owner mode)
-    (let* ((req (foreign-alloc fs-req-size))
-           (op (make-fs-op owner path mode req 'open #f #f -1 0 0 '() 0 0)))
-      (with-interrupts-disabled
-        (hashtable-set! fs-table req op)
-        (index-owner! owner 'fs req))
-      (let ((r (uv-fs-open uv-loop req path O-RDONLY 0 on-fs-entry)))
-        (when (< r 0)
-          (uv-fs-req-cleanup req)
-          (fs-fail! op req r)))
-      op))
+  ;; -> #t while the loop is inside uv_run, i.e. while any libuv callback is
+  ;; running. A predicate rather than the flag, for the reason above.
+  (define (uv-in-callback?) in-uv-run?)
 
- ;; Start the ordinary asynchronous fstat/read pipeline from an fd that
-  ;; has already been opened securely with openat.
-  (define (fs-start-fd! fd path owner mode)
-    (let* ((req (foreign-alloc fs-req-size))
-           (op (make-fs-op owner path mode req 'fstat #f #f fd 0 0 '() 0 0)))
-      (with-interrupts-disabled
-        (hashtable-set! fs-table req op)
-        (index-owner! owner 'fs req))
-      (start-fs-fstat! op req)
-      op))
+  ;; Wake a loop that is blocked in the OS poller.
+  (define (uv-wakeup!)
+    (uv-timer-start wakeup-timer on-timer-entry 0 0))
 
-  (define (relative-parts rel)
-    (let ((n (string-length rel)))
-      (let loop ((i 0) (start 0) (acc '()))
-        (cond
-          ((= i n)
-           (let ((part (substring rel start i)))
-             (reverse (if (or (string=? part "") (string=? part "."))
-                          acc (cons part acc)))))
-          ((char=? (string-ref rel i) #\/)
-           (let ((part (substring rel start i)))
-             (loop (+ i 1) (+ i 1)
-                   (if (or (string=? part "") (string=? part "."))
-                       acc (cons part acc)))))
-          (else (loop (+ i 1) start acc))))))
+  ;; A constant, and exported as one: the fast-write path has to choose its
+  ;; branch on the staging area's size BEFORE it takes the lease, so this one
+  ;; value cannot live behind the lease that hands out the buffer itself.
+  ;; Safe to export directly -- unlike the buffers and the loop, it is never
+  ;; assigned.
+  (define uv-write-scratch-size write-scratch-size)
 
-  ;; Open rel beneath root without following any untrusted path component.
-  ;; The trusted root is opened once per call; every child is then resolved
-  ;; relative to that stable directory fd. Returns an fd or -1.
+  (define (uv-read-buf-base) read-buf)
+  (define (uv-read-buf-size) read-buf-size)
+
+  ;; ---- buffer leases -------------------------------------------------
   ;;
-  ;; Do NOT hoist the root open into a cached fd. A directory fd names an
-  ;; inode, not a path -- which is exactly why the walk below cannot be
-  ;; raced, and exactly why keeping one across requests would pin the
-  ;; directory that was there when it was opened. A deployment that swaps
-  ;; its root atomically (ln -sfn releases/v2 current) would go on serving
-  ;; the previous release until the process restarted, with nothing to
-  ;; indicate it. The saving would be one syscall out of the 1 + 2N this
-  ;; makes, on the cache-miss path only.
-  (define (open-under root rel)
-    (let ((parts (relative-parts rel)))
-      (if (or (null? parts)
-              (exists (lambda (p)
-                        (or (string=? p "..")
-                            (let loop ((i 0))
-                              (and (< i (string-length p))
-                                   (or (char=? (string-ref p i) #\nul)
-                                       (loop (+ i 1)))))))
-                      parts))
-          -1
-          (let ((root-fd
-                  (c-open root
-                    (bitwise-ior O-RDONLY O-DIRECTORY O-CLOEXEC) 0)))
-            (if (< root-fd 0)
-                -1
-                (let loop ((dir root-fd) (xs parts))
-                  (let* ((last? (null? (cdr xs)))
-                         (flags (bitwise-ior O-RDONLY O-CLOEXEC O-NOFOLLOW
-                                  (if last? 0 O-DIRECTORY)))
-                         (next (c-openat dir (car xs) flags 0)))
-                    (c-close dir)
-                    (cond ((< next 0) -1)
-                          (last? next)
-                          (else (loop next (cdr xs)))))))))))
+  ;; Each hands its buffer to a thunk INSIDE one interrupt-disabled region and
+  ;; takes it back when the thunk returns. The caller's whole sequence runs in
+  ;; there, in its original order -- that is what makes "nothing yields
+  ;; between the pack and the syscall" still true after the split, and why the
+  ;; address is never returned to a caller who could hold it past the region.
+  (define (uv-sockaddr-lease proc)
+    (with-interrupts-disabled (proc sockaddr-buf)))
 
-  ;; The path the OS itself would call this file: symlinks and . / ..
-  ;; resolved, and on a case-insensitive filesystem the spelling corrected
-  ;; to the one on disk, so every way of naming one file gives one answer.
-  ;; #f if it does not resolve.
-  ;;
-  ;; SYNCHRONOUS -- a passed callback of 0 makes uv_fs_* block -- so this
-  ;; stalls the scheduler for one path lookup. That is the same cost the
-  ;; surrounding code already pays for file-exists?; do not put it on a
-  ;; path that runs per request when the answer can be cached.
-  (define (file-realpath path)
-    (let ((req (foreign-alloc fs-req-size)))
-      (dynamic-wind
-        (lambda () (void))
-        (lambda ()
-          (let ((r (uv-fs-realpath uv-loop req path 0)))
-            (and (>= r 0)
-                 (let ((p (uv-fs-get-ptr req)))
-                   (and (not (eqv? p 0))
-                        ;; the string is owned by the request; copy before
-                        ;; the cleanup below frees it
-                        (let loop ((i 0) (acc '()))
-                          (let ((b (foreign-ref 'unsigned-8 p i)))
-                            (if (fx= b 0)
-                                (utf8->string
-                                  (u8-list->bytevector (reverse acc)))
-                                (loop (fx+ i 1) (cons b acc))))))))))
-        (lambda ()
-          (uv-fs-req-cleanup req)
-          (foreign-free req)))))
+  (define (uv-peername-lease proc)
+    (with-interrupts-disabled (proc peername-buf peername-len)))
 
-  ;; Read a whole file on libuv's thread pool. The owner process later
-  ;; receives #(file-read ,bytevector) or #(file-error ,errno). Never
-  ;; blocks the scheduler, even for large files or slow filesystems.
-  (define (file-read-async! path owner)
-    (fs-start! path owner 'whole)
-    (void))
+  ;; two buffers, because the fast write path needs both the staging area and
+  ;; the uv_buf_t that points at it
+  (define (uv-scratch-lease proc)
+    (with-interrupts-disabled (proc write-scratch write-scratch-size scratch-buf)))
+  )
 
-  ;; Open a file as a consumer-driven chunk stream; returns the stream
-  ;; handle (also carried by the ready message, and needed to close a
-  ;; stream whose open never completed). The owner later receives
-  ;; #(file-stream ,stream ,size) (ready; size from fstat) or
-  ;; #(file-error ,errno). Then each file-stream-read! yields exactly
-  ;; one of: #(file-chunk ,x) (a bytevector, or its length after
-  ;; file-stream-raw!), #(file-eof) (all bytes delivered or the file
-  ;; shrank -- the fd is already closed), or #(file-error ,errno) (fd
-  ;; closed). One pull may be in flight at a time, so a slow consumer
-  ;; holds one chunk of memory, not the file.
-  (define (file-stream-open! path owner)
-    (fs-start! path owner 'stream))
-
-  ;; Confined counterpart used by app-static and rooted send-file!. #f is
-  ;; an immediate refusal (missing path, symlink, or invalid component).
-  (define (file-stream-open-under! root rel owner)
-    ;; Keep the raw fd continuously protected: before fs-start-fd! installs
-    ;; it in fs-table, actor teardown has no way to discover and close it.
-    (with-interrupts-disabled
-      (let ((fd (open-under root rel)))
-        (and (>= fd 0) (fs-start-fd! fd rel owner 'stream)))))
-
-  ;; Switch chunk delivery to lengths: the bytes stay in the stream's C
-  ;; buffer (file-stream-chunk-ptr) until the next pull, so a consumer
-  ;; that only forwards them (tcp-write-foreign!) never touches the
-  ;; Scheme heap. Set it before the first pull.
-  (define (file-stream-raw! op)
-    (fs-op-raw?-set! op #t))
-
-  (define (file-stream-chunk-ptr op)
-    (fs-op-data op))
-
-  ;; Transfer delivery of subsequent messages to another process (e.g.
-  ;; a pump spawned after the stream was opened). Call it before the
-  ;; new owner's first pull, with no pull in flight.
-  ;; How many file streams are open. Same purpose as conn-count: an fd,
-  ;; a uv_fs_t and a 256 KiB foreign buffer that outlive their owner are
-  ;; invisible from Scheme -- fs-table roots them, so the GC will not
-  ;; report them either -- and a leak that nothing can count is a leak
-  ;; nothing can assert about.
-  (define (fs-count) (hashtable-size fs-table))
-
-  (define (file-stream-own! op pid)
-    (with-interrupts-disabled
-      (fs-op-owner-set! op pid)
-    ;; The INDEX has to learn about the move too, exactly as conn-set-owner!
-    ;; does for connections. Setting only the field meant uv-owner-died! for
-    ;; the new owner found nothing to reclaim: a pump killed mid-download
-    ;; left its fd, its uv_fs_t and its 256 KiB foreign buffer rooted by
-    ;; fs-table for the life of the VM, which is the leak the index exists
-    ;; to prevent.
-      (index-owner! pid 'fs (fs-op-req op))))
-
-  (define (file-stream-read! op)
-    (when (and (not (fs-op-aborted? op)) (eq? (fs-op-phase op) 'idle))
-      (start-fs-read! op (fs-op-req op))))
-
-  ;; Abort/release a stream early (consumer done or gone). Idempotent;
-  ;; nothing further is delivered. With an op in flight the completion
-  ;; callback performs the close.
-  (define (file-stream-close! op)
-    (unless (fs-op-aborted? op)
-      (fs-op-aborted?-set! op #t)
-      (when (eq? (fs-op-phase op) 'idle)
-        (fs-quiet-close! op (fs-op-req op)))))
-
-  ;; Async DNS. The owner process later receives #(dns-resolved ,ip-string)
-  ;; or #(dns-failed ,errno). libuv resolves on its thread pool, so the
-  ;; scheduler is not blocked.
-  (define (dns-resolve! host owner)
-    (let ((req (foreign-alloc getaddrinfo-req-size)))
-      (hashtable-set! getaddrinfo-table req owner)
-      (index-owner! owner 'dns req)
-      (let ((r (uv-getaddrinfo uv-loop req on-getaddrinfo-entry host 0 0)))
-        (when (< r 0)
-          (hashtable-delete! getaddrinfo-table req)
-          (foreign-free req)
-          (deliver owner (vector 'dns-failed r))))))
-
-  ;; Outbound TCP connection. The owner process later receives
-  ;; #(tcp-connected ,conn) or #(tcp-connect-failed ,errno). Call
-  ;; tcp-read-start! on the conn after the connected message arrives.
-  (define (tcp-connect! host port owner)
-    ;; sockaddr-buf is a process-wide singleton and the allocations
-    ;; below are preemption points: another green process starting its
-    ;; own connect (or a listener binding) would overwrite the address
-    ;; we just resolved, and we would connect to ITS host. Also covers
-    ;; the connect-table mutation. Nothing here yields.
-    (with-interrupts-disabled
-    (check 'uv-ip4-addr (uv-ip4-addr host port sockaddr-buf))
-    (let ((h (foreign-alloc tcp-handle-size))
-          (req (foreign-alloc connect-req-size)))
-      (check 'uv-tcp-init (uv-tcp-init uv-loop h))
-      (hashtable-set! connect-table req (cons h owner))
-      (index-owner! owner 'connect req)
-      (let ((r (uv-tcp-connect req h sockaddr-buf on-connect-entry)))
-        (when (< r 0)
-          (hashtable-delete! connect-table req)
-          (foreign-free req)
-          (uv-close h on-close-entry)
-          (error 'tcp-connect! (uv-strerror r)))
-        #t))))
-
-  (define uv-tcp-getpeername
-    (foreign-procedure "uv_tcp_getpeername" (void* void* void*) int))
-
-  ;; The peer's IPv4 address as "a.b.c.d", or #f (not open, IPv6, or the
-  ;; socket is gone). This is the ONLY caller-visible identity a remote
-  ;; client cannot forge -- unlike any header it sends -- so it is what
-  ;; per-client policy (rate limiting, banning) must key on.
-  (define (conn-peer-ip c)
-    (and (eq? (conn-state c) 'open)
-         (with-interrupts-disabled          ; shared peername buffers
-           (foreign-set! 'int peername-len 0 128)
-           (and (>= (uv-tcp-getpeername (conn-handle c) peername-buf peername-len) 0)
-                ;; sockaddr_in: sin_family differs in layout across
-                ;; platforms, but sin_addr is always at offset 4
-                (let ((fam (case platform-os
-                             ((macos freebsd) (foreign-ref 'unsigned-8 peername-buf 1))
-                             (else (foreign-ref 'unsigned-16 peername-buf 0)))))
-                  (and (= fam AF-INET)
-                       (string-append
-                         (number->string (foreign-ref 'unsigned-8 peername-buf 4)) "."
-                         (number->string (foreign-ref 'unsigned-8 peername-buf 5)) "."
-                         (number->string (foreign-ref 'unsigned-8 peername-buf 6)) "."
-                         (number->string (foreign-ref 'unsigned-8 peername-buf 7)))))))))
-
-  ;; Start delivering #(tcp-data ...) messages to the conn's owner.
-  ;; Call after conn-set-owner!.
-  (define (tcp-read-start! c)
-    (when (eq? (conn-state c) 'open)
-      (uv-read-start (conn-handle c) on-alloc-entry on-read-entry)))
-
-  ;; Stop delivering #(tcp-data ...), so the kernel's receive window closes
-  ;; and the PEER is slowed down.
-  ;;
-  ;; Without this the loop reads as fast as the peer sends and copies every
-  ;; segment into an unbounded actor mailbox, so a consumer that is slower
-  ;; than its producer accumulates raw bytes in memory instead of exerting
-  ;; back pressure -- and before any parser limit applies, because those
-  ;; run on bytes that have already been queued. An actor mailbox is not a
-  ;; substitute for the kernel's flow control.
-  ;;
-  ;; Safe to call when reads are already stopped, and on a closed conn.
-  (define (tcp-read-stop! c)
-    (when (eq? (conn-state c) 'open)
-      (uv-read-stop (conn-handle c)))
-    (void))
-
-  ;; Queue `len` bytes for an async write. fill-data! copies them into
-  ;; the foreign data area. Allocates one block [uv_write_t][uv_buf_t]
-  ;; [payload]; write_cb frees it and runs on-done in callback context
-  ;; (must not yield). Returns #t if queued, #f on immediate error.
-  (define (enqueue-write! c len fill-data! on-done)
-    (let* ((block (foreign-alloc (+ write-req-size buf-t-size len)))
-           (buf-ptr (+ block write-req-size))
-           (data-ptr (+ buf-ptr buf-t-size)))
-      (fill-data! data-ptr)
-      (foreign-set! 'void* buf-ptr 0 data-ptr)
-      (foreign-set! 'unsigned-64 buf-ptr 8 len)
-      ;; PUBLISH BEFORE SUBMITTING. uv-write can complete before it returns
-      ;; (a fast loopback write), and the callback looks the block up in
-      ;; write-table -- so registering afterwards is a race the writer
-      ;; loses: the completion finds nothing, frees the block, and the
-      ;; writer then registers a freed address that nothing will ever
-      ;; answer. Upstream that is a stream, a node send or a database
-      ;; operation parked forever.
-      ;;
-      ;; Registering first cannot leak: the only way out without a
-      ;; completion is uv-write failing, and that path removes the entry
-      ;; again. The whole publish/submit pair is interrupt-free so the
-      ;; callback cannot observe a half-built state.
-      (with-interrupts-disabled
-        (hashtable-set! write-table block
-          (or on-done (lambda (status) (void))))
-        (let ((r (uv-write block (conn-handle c) buf-ptr 1 on-write-entry)))
-          (if (< r 0)
-              (begin
-                (hashtable-delete! write-table block)
-                (foreign-free block)
-                (when on-done (on-done r))
-                #f)
-              #t)))))
-
-  ;; Write a sequence of bytevectors as one response. Small writes take
-  ;; the uv_try_write fast path: the segments are packed into the shared
-  ;; scratch buffer and written synchronously, skipping the write_req /
-  ;; write_cb / hashtable / foreign-alloc of the queued path entirely --
-  ;; on-done runs inline with status 0. A partial write or EAGAIN falls
-  ;; back to the queued path for the unwritten remainder; writes larger
-  ;; than the scratch go straight to the queued path. on-done runs in
-  ;; caller context on the fast path (safe: not inside a libuv callback)
-  ;; and in callback context on the queued path; either way it must not
-  ;; yield. Returns #f if the connection is not open (on-done ran -1).
-  (define (tcp-writev! c segs on-done)
-    (if (not (eq? (conn-state c) 'open))
-        (begin (when on-done (on-done -1)) #f)
-        (let ((total (fold-left (lambda (a b) (+ a (bytevector-length b))) 0 segs)))
-          (cond
-            ((<= total write-scratch-size)
-             ;; write-scratch and scratch-buf are process-wide singletons,
-             ;; and this runs in ordinary green processes (an HTTP worker
-             ;; writing a response, a db client sending a query) with the
-             ;; preemption timer live. The packing loop and its foreign
-             ;; calls are safe points, so without this guard a second
-             ;; writer could overwrite the scratch between our pack and
-             ;; our uv_try_write -- and we would send ITS bytes on OUR
-             ;; socket. with-interrupts-disabled is exit-safe; nothing in
-             ;; here yields.
-             (with-interrupts-disabled
-             ;; pack segments into scratch, then try to write in one shot
-             (let loop ((ss segs) (off 0))
-               (unless (null? ss)
-                 (let ((n (bytevector-length (car ss))))
-                   (memcpy-to-c (+ write-scratch off) (car ss) n)
-                   (loop (cdr ss) (+ off n)))))
-             (foreign-set! 'void* scratch-buf 0 write-scratch)
-             (foreign-set! 'unsigned-64 scratch-buf 8 total)
-             (let ((n (uv-try-write (conn-handle c) scratch-buf 1)))
-               (cond
-                 ((= n total)                       ; fully written now
-                  (when on-done (on-done 0)) #t)
-                 ((and (> n 0) (< n total))         ; partial: queue the rest
-                  (enqueue-write! c (- total n)
-                    (lambda (dest) (memcpy-cc dest (+ write-scratch n) (- total n)))
-                    on-done))
-                 (else                              ; EAGAIN/0: queue all
-                  (enqueue-write! c total
-                    (lambda (dest) (memcpy-cc dest write-scratch total))
-                    on-done))))))
-            (else                                    ; too big for scratch
-             (enqueue-write! c total
-               (lambda (dest)
-                 (let loop ((ss segs) (off 0))
-                   (unless (null? ss)
-                     (let ((n (bytevector-length (car ss))))
-                       (memcpy-to-c (+ dest off) (car ss) n)
-                       (loop (cdr ss) (+ off n))))))
-               on-done))))))
-
-  ;; single-bytevector write (websocket / redis / mysql)
-  (define (tcp-write! c bv on-done)
-    (tcp-writev! c (list bv) on-done))
-
-  ;; Write len bytes straight from foreign memory (e.g. a file stream's
-  ;; chunk buffer): the fast path is buffer -> kernel with no copy at
-  ;; all; a partial write or EAGAIN copies only the unwritten remainder
-  ;; into the queued write block. The source buffer is free for reuse
-  ;; as soon as this returns. on-done as in tcp-writev!.
-  (define (tcp-write-foreign! c ptr len on-done)
-    (if (not (eq? (conn-state c) 'open))
-        (begin (when on-done (on-done -1)) #f)
-        (with-interrupts-disabled          ; shared scratch-buf: see tcp-writev!
-          (foreign-set! 'void* scratch-buf 0 ptr)
-          (foreign-set! 'unsigned-64 scratch-buf 8 len)
-          (let ((n (uv-try-write (conn-handle c) scratch-buf 1)))
-            (cond
-              ((= n len)                          ; fully written now
-               (when on-done (on-done 0)) #t)
-              ((and (> n 0) (< n len))            ; partial: queue the rest
-               (enqueue-write! c (- len n)
-                 (lambda (dest) (memcpy-cc dest (+ ptr n) (- len n)))
-                 on-done))
-              (else                               ; EAGAIN/0: queue all
-               (enqueue-write! c len
-                 (lambda (dest) (memcpy-cc dest ptr len))
-                 on-done)))))))
-
-  ;; Idempotent close; memory is freed only in close_cb, so there is no
-  ;; double-close and no fd leak.
-  ;; Attach a cleanup thunk to a connection: it runs exactly once, when
-  ;; libuv reports the handle closed -- WHOEVER closed it. That is the
-  ;; point of hanging it off the conn instead of a code path: an owner
-  ;; killed mid-request closes the conn via uv-owner-died!, and a killed
-  ;; process runs neither winders nor guards, so any cleanup owned by
-  ;; control flow is skipped. Cleanup owned by the resource is not.
-  ;; Registering on an already-closed conn runs the thunk immediately.
-  ;; The thunk runs in libuv callback context: it must not yield, park,
-  ;; or raise (a raise here would unwind into C; it is swallowed).
-  (define (conn-on-close! c thunk)
-    ;; The state test and the store must be ONE operation. Between them the
-    ;; close completion can run, and then the thunk is filed on a conn that
-    ;; will never close again -- so it never runs at all, which for the TLS
-    ;; user of this hook means a leaked SSL session, exactly what it exists
-    ;; to prevent. Running it here instead is correct: the resource is gone,
-    ;; so the cleanup is due now.
-    (let ((run-now?
-            (with-interrupts-disabled
-              (if (eq? (conn-state c) 'closed)
-                  #t
-                  (begin (conn-set-cleanup! c thunk) #f)))))
-      (when run-now? (thunk))))
-
-  (define (tcp-close! c)
-    (when (and (eq? (conn-state c) 'open)
-               (= 0 (uv-is-closing (conn-handle c))))
-      (conn-set-state! c 'closing)
-      (uv-close (conn-handle c) on-close-entry)))
-)

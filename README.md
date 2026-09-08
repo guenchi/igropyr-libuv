@@ -73,7 +73,7 @@ CHEZSCHEMELIBDIRS=. CHEZSCHEMELIBEXTS=.sc scheme --script your-program.ss
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](LICENSE).
 
 [chez]: https://www.scheme.com
 [libuv]: https://libuv.org

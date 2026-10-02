@@ -29,7 +29,7 @@ the process. Honor this and the rest is ordinary Scheme.
 
 ## What it exports
 
-98 names, in four groups:
+Four groups; the export list in `libuv.sc` is the authoritative one:
 
 ```
 the loop      uv-init!  uv-poll!  uv-wakeup!  uv-in-callback?
@@ -64,7 +64,17 @@ Both also live in the [Igropyr][igropyr] source tree. To use `(igropyr
 libuv)`, put `libuv.sc` alongside `platform.sc` and `util.sc` in an
 `igropyr/` directory on your library path, and have **libuv** installed
 on the host (Homebrew `libuv` on macOS, the `libuv` package on
-Linux/FreeBSD).
+Linux/FreeBSD). On macOS it is looked for under both Homebrew prefixes
+— `/opt/homebrew` on Apple silicon, `/usr/local` on x86_64, in each
+one's `lib/` and in the formula's own `opt/libuv/lib/` — before the bare
+library names; the list is `libuv-candidates` in
+[`(igropyr platform)`][platform].
+
+`c-open` and `c-openat` are declared as the variadic C functions they
+are, so the `mode` given with `O_CREAT` reaches the callee. Declared with
+fixed arity, it did not on arm64 macOS, where a variadic argument is
+passed on the stack: files were created with mode `0o010` instead of the
+mode asked for.
 
 ```sh
 # with igropyr/{libuv,platform,util}.sc reachable from the library path
